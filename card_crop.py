@@ -1,28 +1,30 @@
 """
-card_crop.py
-------------
-Batch crop and straighten baseball card scans.
-Replaces scan-buddy entirely — no external repo needed.
+card_crop.py — Detect, crop, and straighten baseball cards from phone photos.
+
+Optimized for:
+  * Phone photos taken looking down at cards on a wood table
+  * Wood grain background (not solid color)
+  * Random card angles, partially visible objects (pans, etc.) in frame
+  * Indoor, uneven lighting
+  * Card occupies roughly 25-40% of the frame
+
+Detection strategy:
+  The wood grain background makes simple thresholding unreliable, so we
+  use multiple complementary strategies and score the results:
+    1. Bilateral filter + Canny edges (smooths grain, preserves card edges)
+    2. Adaptive thresholding (handles uneven lighting)
+    3. LAB L-channel + Otsu (perceptual lightness separates card from wood)
+    4. Grayscale Otsu (simple fallback)
+  Each candidate contour is scored on rectangularity, aspect ratio,
+  area, and circularity (to reject the round pan).
 
 Requires:  pip install opencv-python numpy pillow
 
 Usage:
-    python card_crop.py                         # process CWD, output -> ./output/
-    python card_crop.py --input-dir scans --output-dir cropped
-    python card_crop.py --debug                 # saves debug images showing detected contour
-    python card_crop.py --padding 20            # add N px white border around card
-    python card_crop.py --bg dark               # scanner background is dark (default: auto)
-
-How it works:
-    1. Convert to grayscale, blur, threshold to isolate card from background
-    2. Find the largest 4-corner contour (the card rectangle)
-    3. Perspective-warp that quad to a flat rectangle
-    4. Resize to standard baseball card output resolution (750x1050 px = 2.5x3.5" @ 300dpi)
-    5. Save to output dir
-
-Tuning:
-    If cards aren't detected well, try --bg dark or --bg light to force
-    background detection mode, or --thresh to adjust the binary threshold value.
+    python card_crop.py                                    # process CWD -> ./output/
+    python card_crop.py --input-dir photos --output-dir cropped
+    python card_crop.py --debug                            # save contour overlay images
+    python card_crop.py --padding 10                       # white border (default: 10px)
 """
 
 import argparse
@@ -33,132 +35,252 @@ import cv2
 import numpy as np
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 # Standard baseball card: 2.5" x 3.5" @ 300 DPI
 CARD_W_PX = 750
 CARD_H_PX = 1050
 CARD_ASPECT = CARD_H_PX / CARD_W_PX  # 1.4
 
+# Acceptable aspect-ratio window for a card candidate
+ASPECT_LO = 1.15
+ASPECT_HI = 1.65
 
+# Contour area as a fraction of total image area
+AREA_MIN = 0.04
+AREA_MAX = 0.65
+
+# Maximum image dimension during detection (speed vs accuracy)
+DETECT_MAX_DIM = 1500
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Batch baseball card scan cropper")
-    p.add_argument("--input-dir",  default=".",      help="Folder of input images (default: .)")
-    p.add_argument("--output-dir", default="output", help="Folder for results (default: ./output)")
-    p.add_argument("--ext",        default="jpg,jpeg,png,tiff,bmp,JPG,JPEG,PNG,TIFF,BMP")
-    p.add_argument("--bg",         default="auto",   choices=["auto","dark","light"],
-                                                     help="Scanner background color hint")
-    p.add_argument("--thresh",     default=None, type=int,
-                                                     help="Manual binary threshold 0-255 (skips auto)")
-    p.add_argument("--padding",    default=0,    type=int,
-                                                     help="Extra white border in pixels added after crop")
-    p.add_argument("--no-resize",  action="store_true",
-                                                     help="Skip resize to standard card dimensions")
-    p.add_argument("--debug",      action="store_true",
-                                                     help="Save debug contour images alongside outputs")
-    p.add_argument("--dry-run",    action="store_true")
+    p = argparse.ArgumentParser(description="Baseball card photo cropper")
+    p.add_argument("--input-dir", default=".",
+                   help="Folder of input images (default: .)")
+    p.add_argument("--output-dir", default="output",
+                   help="Folder for results (default: ./output)")
+    p.add_argument("--ext",
+                   default="jpg,jpeg,png,tiff,bmp,JPG,JPEG,PNG,TIFF,BMP",
+                   help="Comma-separated file extensions to process")
+    p.add_argument("--padding", default=10, type=int,
+                   help="White border in px added after crop (default: 10)")
+    p.add_argument("--no-resize", action="store_true",
+                   help="Skip resize to standard card dimensions")
+    p.add_argument("--debug", action="store_true",
+                   help="Save debug images showing detected contour")
+    p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
 def order_points(pts):
     """Order 4 points: top-left, top-right, bottom-right, bottom-left."""
     pts = pts.reshape(4, 2).astype(np.float32)
     s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1)
+    d = np.diff(pts, axis=1).ravel()
     return np.array([
-        pts[np.argmin(s)],    # top-left
-        pts[np.argmin(diff)], # top-right
-        pts[np.argmax(s)],    # bottom-right
-        pts[np.argmax(diff)], # bottom-left
+        pts[np.argmin(s)],      # TL: smallest x+y
+        pts[np.argmin(d)],      # TR: smallest y-x
+        pts[np.argmax(s)],      # BR: largest  x+y
+        pts[np.argmax(d)],      # BL: largest  y-x
     ], dtype=np.float32)
 
 
 def four_point_transform(image, pts):
-    """Perspective warp a quadrilateral to a rectangle."""
+    """Perspective-warp a quadrilateral to a flat rectangle."""
     rect = order_points(pts)
     tl, tr, br, bl = rect
 
-    width  = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
-    height = max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))
-    width, height = int(width), int(height)
+    w = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    h = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if w < 10 or h < 10:
+        return None
 
-    dst = np.array([
-        [0,         0],
-        [width - 1, 0],
-        [width - 1, height - 1],
-        [0,         height - 1],
-    ], dtype=np.float32)
-
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+                   dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (width, height))
+    return cv2.warpPerspective(image, M, (w, h))
 
 
-def detect_card_contour(gray, bg_hint="auto", manual_thresh=None):
+# ---------------------------------------------------------------------------
+# Contour scoring
+# ---------------------------------------------------------------------------
+def _score_contour(cnt, img_area):
     """
-    Return the 4-point contour of the card, or None if not found.
-    Tries multiple strategies to handle different scan conditions.
+    Score how likely a contour is to be a baseball card.
+    Returns (score, 4-point quad) or (-1, None) if rejected.
     """
-    h, w = gray.shape
+    area = cv2.contourArea(cnt)
+    if area < img_area * AREA_MIN or area > img_area * AREA_MAX:
+        return -1, None
 
-    # Determine background: scanners are usually very dark or very white
-    if bg_hint == "auto":
-        # Sample corners to judge background brightness
-        corners = [gray[0:50, 0:50], gray[0:50, w-50:w],
-                   gray[h-50:h, 0:50], gray[h-50:h, w-50:w]]
-        bg_mean = np.mean([c.mean() for c in corners])
-        bg_hint = "dark" if bg_mean < 128 else "light"
+    peri = cv2.arcLength(cnt, True)
+    if peri < 1:
+        return -1, None
 
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    # Reject circles (the pan).  Circularity of a perfect circle ~ 1.0
+    circularity = 4 * np.pi * area / (peri * peri)
+    if circularity > 0.85:
+        return -1, None
 
-    if manual_thresh is not None:
-        if bg_hint == "dark":
-            _, binary = cv2.threshold(blurred, manual_thresh, 255, cv2.THRESH_BINARY)
-        else:
-            _, binary = cv2.threshold(blurred, manual_thresh, 255, cv2.THRESH_BINARY_INV)
+    # Bounding rotated rectangle
+    rect = cv2.minAreaRect(cnt)
+    rw, rh = rect[1]
+    if min(rw, rh) < 1:
+        return -1, None
+
+    aspect = max(rw, rh) / min(rw, rh)
+    if aspect < ASPECT_LO or aspect > ASPECT_HI:
+        return -1, None
+
+    # Rectangularity: how much of the rotated rect the contour fills
+    rect_area = rw * rh
+    rectangularity = area / rect_area if rect_area > 0 else 0
+
+    # Polygon approximation — prefer exactly 4 corners
+    approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+    has_four = (len(approx) == 4)
+
+    # Aspect-ratio closeness to ideal 1.4
+    aspect_score = max(0.0, 1.0 - abs(aspect - CARD_ASPECT) / 0.5)
+
+    # Larger contours (within bounds) are more likely to be the card
+    size_score = area / img_area
+
+    score = (
+        aspect_score    * 0.35
+        + rectangularity * 0.30
+        + size_score     * 0.20
+        + (0.15 if has_four else 0.0)
+    )
+
+    # Build the 4-point output
+    if has_four:
+        quad = approx
     else:
-        if bg_hint == "dark":
-            # Card is brighter than the dark scanner bed
-            _, binary = cv2.threshold(blurred, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        else:
-            # Card is darker than white background — invert
-            _, binary = cv2.threshold(blurred, 0, 255,
-                                      cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        box = cv2.boxPoints(rect)
+        quad = np.intp(box).reshape(4, 1, 2)
 
-    # Morphological cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
+    return score, quad
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, binary
 
-    # Sort by area descending — card should be the largest contour
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+def _collect_candidates(contours, img_area):
+    """Score contours and return list of (score, quad)."""
+    results = []
+    for cnt in contours:
+        sc, quad = _score_contour(cnt, img_area)
+        if sc > 0:
+            results.append((sc, quad))
+    return results
 
+
+# ---------------------------------------------------------------------------
+# Multi-strategy card detection
+# ---------------------------------------------------------------------------
+def detect_card(img):
+    """
+    Try multiple detection strategies to find the card in a phone photo.
+    Returns (4-point contour, strategy_name) or (None, None).
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
     img_area = h * w
-    for cnt in contours[:5]:  # check top 5 largest
-        area = cv2.contourArea(cnt)
-        if area < img_area * 0.05:  # skip tiny blobs
-            continue
+    candidates = []   # (score, quad, strategy_name)
 
-        # Try to approximate to 4 corners
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+    # ------------------------------------------------------------------
+    # Strategy 1 — Bilateral filter + Canny edges
+    # Bilateral smooths wood grain texture while preserving the strong
+    # edge at the card boundary.  Multiple Canny threshold pairs give
+    # robustness across different lighting conditions.
+    # ------------------------------------------------------------------
+    bilateral = cv2.bilateralFilter(gray, 11, 75, 75)
+    for lo, hi in [(30, 100), (50, 150), (20, 70)]:
+        edges = cv2.Canny(bilateral, lo, hi)
+        kern_d = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.dilate(edges, kern_d, iterations=3)
+        closed = cv2.morphologyEx(
+            closed, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        )
+        cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        for sc, quad in _collect_candidates(cnts, img_area):
+            candidates.append((sc, quad, f"canny({lo},{hi})"))
 
-        if len(approx) == 4:
-            return approx, binary
+    # ------------------------------------------------------------------
+    # Strategy 2 — Adaptive threshold
+    # Handles uneven indoor lighting.  The card's light border becomes
+    # foreground against the darker wood background.
+    # ------------------------------------------------------------------
+    bilateral2 = cv2.bilateralFilter(gray, 15, 80, 80)
+    for bsz in [31, 51, 71]:
+        for C in [-5, -10, -20]:
+            binary = cv2.adaptiveThreshold(
+                bilateral2, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+                bsz, C
+            )
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
+            cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            for sc, quad in _collect_candidates(cnts, img_area):
+                candidates.append((sc, quad, f"adapt(b={bsz},C={C})"))
 
-        # If not 4 corners, use the bounding rotated rect as fallback
-        rect = cv2.minAreaRect(cnt)
-        box  = cv2.boxPoints(rect)
-        box  = np.intp(box)
-        return box.reshape(4, 1, 2), binary
+    # ------------------------------------------------------------------
+    # Strategy 3 — LAB L-channel + Otsu
+    # The L channel in LAB represents perceptual lightness, giving good
+    # card-vs-wood separation even with color variation in the wood.
+    # ------------------------------------------------------------------
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_ch = lab[:, :, 0]
+    l_blur = cv2.GaussianBlur(l_ch, (7, 7), 0)
+    _, binary3 = cv2.threshold(l_blur, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    binary3 = cv2.morphologyEx(binary3, cv2.MORPH_CLOSE, k)
+    binary3 = cv2.morphologyEx(binary3, cv2.MORPH_OPEN, k)
+    cnts, _ = cv2.findContours(binary3, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    for sc, quad in _collect_candidates(cnts, img_area):
+        candidates.append((sc, quad, "lab+otsu"))
 
-    return None, binary
+    # ------------------------------------------------------------------
+    # Strategy 4 — Simple grayscale Otsu (fallback)
+    # ------------------------------------------------------------------
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, binary4 = cv2.threshold(blurred, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    binary4 = cv2.morphologyEx(binary4, cv2.MORPH_CLOSE, k)
+    binary4 = cv2.morphologyEx(binary4, cv2.MORPH_OPEN, k)
+    cnts, _ = cv2.findContours(binary4, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    for sc, quad in _collect_candidates(cnts, img_area):
+        candidates.append((sc, quad, "otsu"))
+
+    if not candidates:
+        return None, None
+
+    # Pick the highest-scoring candidate
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, best_quad, strategy = candidates[0]
+    return best_quad, strategy
 
 
-def orient_to_portrait(img):
-    """Flip to portrait if image came out landscape."""
+# ---------------------------------------------------------------------------
+# Orientation helpers
+# ---------------------------------------------------------------------------
+def orient_portrait(img):
+    """Rotate to portrait if the image came out landscape."""
     h, w = img.shape[:2]
     if w > h:
         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
@@ -167,72 +289,122 @@ def orient_to_portrait(img):
 
 def fix_upside_down(img):
     """
-    Baseball cards: detect if the image is upside-down by checking
-    whether more bright content is in the top or bottom half.
-    Cards typically have the photo in the upper 60% and the stat box below —
-    the stat box is usually lighter (white/cream).
-    
-    Simple heuristic: if bottom half is significantly brighter than top, flip.
+    Heuristic: baseball cards usually have a player photo on top and a
+    lighter stat bar / name plate on the bottom third.  If the bottom
+    third is significantly brighter than the top third, assume the card
+    is upside-down and rotate 180 degrees.
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     h = gray.shape[0]
-    top_mean    = gray[:h//2, :].mean()
-    bottom_mean = gray[h//2:, :].mean()
-    if bottom_mean > top_mean + 15:
-        # Bottom is brighter → card is upside down
+    top_mean = gray[:h // 3, :].mean()
+    bot_mean = gray[2 * h // 3:, :].mean()
+    if bot_mean > top_mean + 20:
         img = cv2.rotate(img, cv2.ROTATE_180)
     return img
 
 
-def process_image(src: Path, dst: Path, args, debug_dir=None):
+# ---------------------------------------------------------------------------
+# Image processing pipeline
+# ---------------------------------------------------------------------------
+def process_image(src, dst, args, debug_dir=None):
+    """Process a single image: detect card, warp, orient, resize, save."""
     img = cv2.imread(str(src))
     if img is None:
         return False, "Could not read image"
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    contour, binary = detect_card_contour(gray, args.bg, args.thresh)
+    oh, ow = img.shape[:2]
 
+    # Downscale for faster detection on large phone photos
+    if max(oh, ow) > DETECT_MAX_DIM:
+        scale = DETECT_MAX_DIM / max(oh, ow)
+        small = cv2.resize(img, (int(ow * scale), int(oh * scale)),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = img
+        scale = 1.0
+
+    contour, strategy = detect_card(small)
     if contour is None:
-        return False, "No card contour found"
+        # Save failed debug image if requested
+        if debug_dir:
+            debug_path = debug_dir / f"FAIL_{src.stem}.jpg"
+            _save_debug_fail(img, debug_path)
+        return False, "No card detected"
 
-    # Perspective warp
+    # Scale contour back to original resolution
+    if scale != 1.0:
+        contour = (contour.astype(np.float64) / scale).astype(np.float32)
+
+    # Perspective warp on full-resolution image
     warped = four_point_transform(img, contour)
+    if warped is None:
+        return False, "Warp failed (degenerate quad)"
 
-    # Orient to portrait
-    warped = orient_to_portrait(warped)
-
-    # Try to fix upside-down cards
+    warped = orient_portrait(warped)
     warped = fix_upside_down(warped)
 
-    # Add padding
+    # Add white padding
     if args.padding > 0:
         p = args.padding
         warped = cv2.copyMakeBorder(warped, p, p, p, p,
-                                    cv2.BORDER_CONSTANT, value=(255, 255, 255))
+                                    cv2.BORDER_CONSTANT,
+                                    value=(255, 255, 255))
 
     # Resize to standard card dimensions
     if not args.no_resize:
-        h, w = warped.shape[:2]
-        # Decide orientation of output based on warped content
-        if h >= w:
-            out_w, out_h = CARD_W_PX, CARD_H_PX
-        else:
-            out_w, out_h = CARD_H_PX, CARD_W_PX
-        warped = cv2.resize(warped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+        warped = cv2.resize(warped, (CARD_W_PX, CARD_H_PX),
+                            interpolation=cv2.INTER_LANCZOS4)
 
     cv2.imwrite(str(dst), warped, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    # Debug output
+    # Debug overlay — draw detected contour on the original image
     if debug_dir:
-        debug_img = img.copy()
-        cv2.drawContours(debug_img, [contour], -1, (0, 255, 0), 8)
-        debug_path = debug_dir / f"debug_{src.name}"
-        cv2.imwrite(str(debug_path), debug_img)
+        _save_debug_overlay(img, contour, strategy, debug_dir, src.stem)
 
-    return True, "OK"
+    return True, f"OK ({strategy})"
 
 
-def collect_images(input_dir: Path, extensions: list[str]) -> list[Path]:
+def _save_debug_overlay(img, contour, strategy, debug_dir, stem):
+    """Save an annotated copy of the original with the detected quad."""
+    debug_img = img.copy()
+    oh = img.shape[0]
+    pts = contour.reshape(4, 2).astype(np.int32)
+
+    # Green quad outline
+    thickness = max(3, oh // 300)
+    cv2.polylines(debug_img, [pts], True, (0, 255, 0), thickness)
+
+    # Red corner dots
+    radius = max(8, oh // 200)
+    for pt in pts:
+        cv2.circle(debug_img, tuple(pt), radius, (0, 0, 255), -1)
+
+    # Strategy label
+    font_scale = max(0.8, oh / 2000)
+    cv2.putText(debug_img, strategy, (30, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), 2)
+
+    # Shrink for reasonable file size
+    if max(debug_img.shape[:2]) > 2000:
+        ds = 2000 / max(debug_img.shape[:2])
+        debug_img = cv2.resize(debug_img, None, fx=ds, fy=ds)
+
+    debug_path = debug_dir / f"debug_{stem}.jpg"
+    cv2.imwrite(str(debug_path), debug_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+
+def _save_debug_fail(img, debug_path):
+    """Save a reduced copy of an image that failed detection."""
+    if max(img.shape[:2]) > 2000:
+        ds = 2000 / max(img.shape[:2])
+        img = cv2.resize(img, None, fx=ds, fy=ds)
+    cv2.imwrite(str(debug_path), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+
+# ---------------------------------------------------------------------------
+# Batch runner
+# ---------------------------------------------------------------------------
+def collect_images(input_dir, extensions):
     images = []
     for ext in extensions:
         images.extend(input_dir.glob(f"*.{ext}"))
@@ -241,7 +413,7 @@ def collect_images(input_dir: Path, extensions: list[str]) -> list[Path]:
 
 def main():
     args = parse_args()
-    input_dir  = Path(args.input_dir).resolve()
+    input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     extensions = [e.strip().lstrip(".") for e in args.ext.split(",")]
 
@@ -265,13 +437,17 @@ def main():
     print(f"[INFO] Input  : {input_dir}")
     print(f"[INFO] Output : {output_dir}")
     print(f"[INFO] Images : {len(images)}")
-    print(f"[INFO] BG mode: {args.bg}")
+    print(f"[INFO] Padding: {args.padding}px")
+    if args.debug:
+        print(f"[INFO] Debug  : ON")
     print()
 
     ok = fail = 0
     for img_path in images:
-        out_path = output_dir / img_path.name
-        print(f"  {img_path.name}  ->  {out_path.name}", end="  ")
+        out_name = img_path.stem + ".jpg"
+        out_path = output_dir / out_name
+        tag = img_path.name
+        print(f"  {tag:40s}", end="  ")
 
         if args.dry_run:
             print("[DRY RUN]")
@@ -280,15 +456,15 @@ def main():
         success, msg = process_image(img_path, out_path, args, debug_dir)
         if success:
             ok += 1
-            print(f"[OK]")
+            print(f"[OK] {msg}")
         else:
             fail += 1
-            print(f"[FAILED] {msg}")
+            print(f"[FAIL] {msg}")
 
     if not args.dry_run:
-        print(f"\n[DONE] {ok} ok, {fail} failed — results in: {output_dir}")
-        if args.debug:
-            print(f"[DEBUG] Contour overlays saved in: {debug_dir}")
+        print(f"\n[DONE] {ok} succeeded, {fail} failed -> {output_dir}")
+        if args.debug and debug_dir:
+            print(f"[DEBUG] Overlays saved in -> {debug_dir}")
 
 
 if __name__ == "__main__":
