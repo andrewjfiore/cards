@@ -15,6 +15,8 @@ Detection strategy:
     2. Adaptive thresholding (handles uneven lighting)
     3. LAB L-channel + Otsu (perceptual lightness separates card from wood)
     4. Grayscale Otsu (simple fallback)
+    5. HSV saturation + Otsu (dark-bordered cards are colorful vs brown wood)
+    6. Median blur + Otsu (median filter kills periodic wood grain patterns)
   Each candidate contour is scored on rectangularity, aspect ratio,
   area, and circularity (to reject the round pan).
 
@@ -267,6 +269,41 @@ def detect_card(img):
     for sc, quad in _collect_candidates(cnts, img_area):
         candidates.append((sc, quad, "otsu"))
 
+    # ------------------------------------------------------------------
+    # Strategy 5 — HSV saturation + Otsu
+    # Card fronts with dark borders are hard to detect by brightness
+    # alone, but they're far more colorful/saturated than the brown
+    # wood table.  This separates vibrant card art from muted wood.
+    # ------------------------------------------------------------------
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    s_ch = hsv[:, :, 1]
+    s_blur = cv2.GaussianBlur(s_ch, (7, 7), 0)
+    _, binary5 = cv2.threshold(s_blur, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    binary5 = cv2.morphologyEx(binary5, cv2.MORPH_CLOSE, k)
+    binary5 = cv2.morphologyEx(binary5, cv2.MORPH_OPEN, k)
+    cnts, _ = cv2.findContours(binary5, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    for sc, quad in _collect_candidates(cnts, img_area):
+        candidates.append((sc, quad, "hsv_sat"))
+
+    # ------------------------------------------------------------------
+    # Strategy 6 — Median blur + Otsu
+    # Median filter is especially good at wiping out periodic texture
+    # patterns like wood grain while preserving the card's sharp edges.
+    # ------------------------------------------------------------------
+    median = cv2.medianBlur(gray, 15)
+    _, binary6 = cv2.threshold(median, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    binary6 = cv2.morphologyEx(binary6, cv2.MORPH_CLOSE, k)
+    binary6 = cv2.morphologyEx(binary6, cv2.MORPH_OPEN, k)
+    cnts, _ = cv2.findContours(binary6, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    for sc, quad in _collect_candidates(cnts, img_area):
+        candidates.append((sc, quad, "median+otsu"))
+
     if not candidates:
         return None, None
 
@@ -298,7 +335,7 @@ def fix_upside_down(img):
     h = gray.shape[0]
     top_mean = gray[:h // 3, :].mean()
     bot_mean = gray[2 * h // 3:, :].mean()
-    if bot_mean > top_mean + 20:
+    if bot_mean > top_mean + 25:
         img = cv2.rotate(img, cv2.ROTATE_180)
     return img
 
