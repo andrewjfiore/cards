@@ -1,50 +1,53 @@
 @echo off
 REM ============================================================
-REM  run_card_crop.bat
-REM  Batch crop + straighten baseball card scans.
+REM  run_card_crop.bat — Baseball Card Photo Cropper
+REM
+REM  Detects, crops, and straightens baseball cards from phone
+REM  photos taken on a wood table.
 REM
 REM  SETUP (one time):
 REM    pip install opencv-python numpy pillow
 REM
-REM  Just drop your DSC*.JPG files in this folder and run.
+REM  Drop your phone photos in INPUT_DIR and double-click this.
 REM ============================================================
 
-:: ---- Settings ----------------------------------------------
-SET INPUT_DIR=.
-SET OUTPUT_DIR=output
-SET BG=dark
-:: Options: auto, dark, light
-:: dark  = scanner bed is black (most flatbed scanners)
-:: light = scanner bed or background is white
+:: ---- SETTINGS (edit these) ----------------------------------
 
-:: Optional: add white border around each card in pixels (0 = none)
+:: Folder containing your phone photos
+SET INPUT_DIR=.
+
+:: Folder where cropped cards will be saved
+SET OUTPUT_DIR=output
+
+:: White border added around each card, in pixels (0 = none)
 SET PADDING=10
 
-:: Uncomment to add --debug flag (saves contour overlay images)
-:: SET DEBUG=--debug
+:: Debug mode: saves an image showing the detected contour in
+:: green so you can diagnose failures.
+:: Set to --debug to enable, or leave blank to disable.
 SET DEBUG=
-:: ------------------------------------------------------------
+:: SET DEBUG=--debug
+
+:: ---- END SETTINGS -------------------------------------------
 
 echo.
 echo  ==========================================
-echo   Baseball Card Batch Cropper
+echo   Baseball Card Photo Cropper
 echo  ==========================================
 echo   Input  : %INPUT_DIR%
 echo   Output : %OUTPUT_DIR%
-echo   BG mode: %BG%
+echo   Padding: %PADDING%px
 echo.
 
 python card_crop.py ^
     --input-dir  "%INPUT_DIR%"  ^
     --output-dir "%OUTPUT_DIR%" ^
-    --bg         "%BG%"         ^
     --padding    "%PADDING%"    ^
     %DEBUG%
 
 echo.
 IF %ERRORLEVEL% EQU 0 (
     echo  Done! Results are in "%OUTPUT_DIR%"
-    echo  If results look wrong, try editing BG=dark or BG=light in this .bat
 ) ELSE (
     echo  Error occurred - check output above.
 )
