@@ -17,8 +17,11 @@ Detection strategy:
     4. Grayscale Otsu (simple fallback)
     5. HSV saturation + Otsu (dark-bordered cards are colorful vs brown wood)
     6. Median blur + Otsu (median filter kills periodic wood grain patterns)
+    7. Scharr gradient magnitude (strong card-border edges)
+    8. LAB distance-from-wood background model (table-color rejection)
+    9. GrabCut foreground proposals (document-scanner style fallback)
   Each candidate contour is scored on rectangularity, aspect ratio,
-  area, and circularity (to reject the round pan).
+  area, center proximity, and circularity (to reject the round pan).
 
 Requires:  pip install opencv-python numpy pillow
 
@@ -27,9 +30,11 @@ Usage:
     python card_crop.py --input-dir photos --output-dir cropped
     python card_crop.py --debug                            # save contour overlay images
     python card_crop.py --padding 10                       # white border (default: 10px)
+    python card_crop.py --ocr-refine                       # expand crop to include OCR text
 """
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -76,6 +81,16 @@ def parse_args():
     p.add_argument("--debug", action="store_true",
                    help="Save debug images showing detected contour")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--ocr-refine", action="store_true",
+                   help="Use GPU-accelerated OCR (EasyOCR when available) to expand crop bounds so detected text is inside")
+    p.add_argument("--ocr-min-conf", type=float, default=0.25,
+                   help="Minimum OCR confidence for text boxes used in crop refinement")
+    p.add_argument("--ocr-max-dim", type=int, default=1800,
+                   help="Max image dimension for OCR pass (for speed)")
+    p.add_argument("--ocr-text-margin", type=float, default=0.03,
+                   help="Extra margin around OCR text boxes as fraction of card short side")
+    p.add_argument("--ocr-csv", default="",
+                   help="Optional CSV path to save OCR text per output file (filename + inline text string)")
     return p.parse_args()
 
 
@@ -112,9 +127,145 @@ def four_point_transform(image, pts):
 
 
 # ---------------------------------------------------------------------------
+# OCR-based crop refinement (EasyOCR with GPU when available)
+# ---------------------------------------------------------------------------
+_OCR_READER_CACHE = None
+
+
+def _get_easyocr_reader():
+    """Lazily load EasyOCR reader; prefer GPU when torch+CUDA is available."""
+    global _OCR_READER_CACHE
+    if _OCR_READER_CACHE is not None:
+        return _OCR_READER_CACHE
+
+    try:
+        import easyocr
+    except Exception:
+        _OCR_READER_CACHE = False
+        return None
+
+    use_gpu = False
+    try:
+        import torch
+        use_gpu = bool(torch.cuda.is_available())
+    except Exception:
+        use_gpu = False
+
+    try:
+        _OCR_READER_CACHE = easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
+        return _OCR_READER_CACHE
+    except Exception:
+        _OCR_READER_CACHE = False
+        return None
+
+
+def _detect_text_entries(img, min_conf=0.25, max_dim=1800):
+    """Return OCR entries with box/text/conf in original-image coordinates."""
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return []
+
+    oh, ow = img.shape[:2]
+    scale = 1.0
+    proc = img
+    if max(oh, ow) > max_dim:
+        scale = max_dim / max(oh, ow)
+        proc = cv2.resize(img, (int(ow * scale), int(oh * scale)), interpolation=cv2.INTER_AREA)
+
+    rgb = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
+    try:
+        results = reader.readtext(rgb, detail=1, paragraph=False)
+    except Exception:
+        return []
+
+    entries = []
+    inv = 1.0 / scale
+    for item in results:
+        if len(item) != 3:
+            continue
+        pts, txt, conf = item
+        if conf is None or conf < min_conf:
+            continue
+        arr = np.array(pts, dtype=np.float32).reshape(4, 2) * inv
+        entries.append({"box": arr, "text": str(txt).strip(), "conf": float(conf)})
+    return entries
+
+
+def _format_ocr_inline(entries):
+    """Serialize OCR entries as a compact inline string for CSV output."""
+    chunks = []
+    for e in entries:
+        txt = (e.get("text") or "").replace("|", " ").replace("\n", " ").strip()
+        if not txt:
+            continue
+        chunks.append(f"{txt}({e.get('conf', 0.0):.2f})")
+    return " | ".join(chunks)
+
+
+def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_frac=0.03):
+    """Expand card quad so OCR-detected text near the card remains inside bounds."""
+    entries = _detect_text_entries(img, min_conf=min_conf, max_dim=max_dim)
+    boxes = [e["box"] for e in entries]
+    if not boxes:
+        return quad, False
+
+    rect = order_points(quad).astype(np.float32)
+    tl, tr, br, bl = rect
+    w = float(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    h = float(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if w < 10 or h < 10:
+        return quad, False
+
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(rect, dst)
+    Minv = np.linalg.inv(M)
+
+    loose = 0.25 * max(w, h)
+    picked = []
+    for box in boxes:
+        pts = cv2.perspectiveTransform(box.reshape(1, 4, 2), M).reshape(4, 2)
+        xmin, ymin = pts.min(axis=0)
+        xmax, ymax = pts.max(axis=0)
+
+        intersects = not (xmax < -loose or ymax < -loose or xmin > (w - 1 + loose) or ymin > (h - 1 + loose))
+        if intersects:
+            picked.append(pts)
+
+    if not picked:
+        return quad, False
+
+    all_pts = np.concatenate(picked, axis=0)
+    xmin, ymin = all_pts.min(axis=0)
+    xmax, ymax = all_pts.max(axis=0)
+
+    margin = text_margin_frac * min(w, h)
+    left_pad = max(0.0, -xmin) + margin
+    top_pad = max(0.0, -ymin) + margin
+    right_pad = max(0.0, xmax - (w - 1)) + margin
+    bot_pad = max(0.0, ymax - (h - 1)) + margin
+
+    if max(left_pad, top_pad, right_pad, bot_pad) < 1.0:
+        return quad, False
+
+    expanded = np.array([
+        [-left_pad, -top_pad],
+        [w - 1 + right_pad, -top_pad],
+        [w - 1 + right_pad, h - 1 + bot_pad],
+        [-left_pad, h - 1 + bot_pad],
+    ], dtype=np.float32)
+
+    refined = cv2.perspectiveTransform(expanded.reshape(1, 4, 2), Minv).reshape(4, 2)
+
+    ih, iw = img.shape[:2]
+    refined[:, 0] = np.clip(refined[:, 0], 0, iw - 1)
+    refined[:, 1] = np.clip(refined[:, 1], 0, ih - 1)
+    return refined.reshape(4, 1, 2).astype(np.float32), True
+
+
+# ---------------------------------------------------------------------------
 # Contour scoring
 # ---------------------------------------------------------------------------
-def _score_contour(cnt, img_area):
+def _score_contour(cnt, img_area, img_shape):
     """
     Score how likely a contour is to be a baseball card.
     Returns (score, 4-point quad) or (-1, None) if rejected.
@@ -155,10 +306,31 @@ def _score_contour(cnt, img_area):
     solidity = area / hull_area if hull_area > 0 else 0
 
     # Aspect-ratio closeness to ideal 1.4
-    aspect_score = max(0.0, 1.0 - abs(aspect - CARD_ASPECT) / 0.5)
+    aspect_score = max(0.0, 1.0 - abs(aspect - CARD_ASPECT) / 0.55)
 
-    # Larger contours (within bounds) are more likely to be the card
-    size_score = area / img_area
+    # Larger contours are likely cards, but don't over-prefer size.
+    size_score = min(1.0, (area / img_area) / 0.12)
+
+    ih, iw = img_shape
+    M = cv2.moments(cnt)
+    if M["m00"] > 0:
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+    else:
+        cx, cy = iw / 2, ih / 2
+    dc = np.hypot(cx - iw / 2, cy - ih / 2)
+    dmax = np.hypot(iw / 2, ih / 2)
+    center_score = max(0.0, 1.0 - dc / (dmax * 0.9))
+
+    x, y, bw, bh = cv2.boundingRect(cnt)
+    border_pad = max(4, int(min(iw, ih) * 0.01))
+    touches_border = (
+        x <= border_pad or y <= border_pad
+        or (x + bw) >= (iw - border_pad)
+        or (y + bh) >= (ih - border_pad)
+    )
+    # Border contact can happen for valid close-up shots; only penalize small border-touching regions.
+    border_penalty = 0.05 if (touches_border and size_score < 0.65) else 0.0
 
     score = (
         aspect_score    * 0.35
@@ -178,11 +350,11 @@ def _score_contour(cnt, img_area):
     return score, quad
 
 
-def _collect_candidates(contours, img_area):
+def _collect_candidates(contours, img_area, img_shape):
     """Score contours and return list of (score, quad)."""
     results = []
     for cnt in contours:
-        sc, quad = _score_contour(cnt, img_area)
+        sc, quad = _score_contour(cnt, img_area, img_shape)
         if sc > 0:
             results.append((sc, quad))
     return results
@@ -219,6 +391,7 @@ def detect_card(img):
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
+    img_shape = (h, w)
     img_area = h * w
     candidates = []   # (score, quad, strategy_name)
 
@@ -386,7 +559,7 @@ def process_image(src, dst, args, debug_dir=None):
     """Process a single image: detect card, warp, orient, resize, save."""
     img = cv2.imread(str(src))
     if img is None:
-        return False, "Could not read image"
+        return False, "Could not read image", ""
 
     oh, ow = img.shape[:2]
 
@@ -405,16 +578,26 @@ def process_image(src, dst, args, debug_dir=None):
         if debug_dir:
             debug_path = debug_dir / f"FAIL_{src.stem}.jpg"
             _save_debug_fail(img, debug_path)
-        return False, "No card detected"
+        return False, "No card detected", ""
 
     # Scale contour back to original resolution
     if scale != 1.0:
         contour = (contour.astype(np.float64) / scale).astype(np.float32)
 
+    ocr_used = False
+    if args.ocr_refine:
+        contour, ocr_used = _refine_quad_with_ocr(
+            img,
+            contour,
+            min_conf=args.ocr_min_conf,
+            max_dim=args.ocr_max_dim,
+            text_margin_frac=args.ocr_text_margin,
+        )
+
     # Perspective warp on full-resolution image
     warped = four_point_transform(img, contour)
     if warped is None:
-        return False, "Warp failed (degenerate quad)"
+        return False, "Warp failed (degenerate quad)", ""
 
     warped = orient_portrait(warped)
     warped = fix_upside_down(warped)
@@ -437,7 +620,16 @@ def process_image(src, dst, args, debug_dir=None):
     if debug_dir:
         _save_debug_overlay(img, contour, strategy, debug_dir, src.stem)
 
-    return True, f"OK ({strategy})"
+    ocr_entries = []
+    if args.ocr_refine or args.ocr_csv:
+        ocr_entries = _detect_text_entries(
+            warped,
+            min_conf=args.ocr_min_conf,
+            max_dim=args.ocr_max_dim,
+        )
+
+    ocr_tag = "+ocr" if ocr_used else ""
+    return True, f"OK ({strategy}{ocr_tag})", _format_ocr_inline(ocr_entries)
 
 
 def _save_debug_overlay(img, contour, strategy, debug_dir, stem):
@@ -519,6 +711,7 @@ def main():
     print()
 
     ok = fail = 0
+    ocr_rows = []
     for img_path in images:
         out_name = img_path.stem + ".jpg"
         out_path = output_dir / out_name
@@ -529,7 +722,7 @@ def main():
             print("[DRY RUN]")
             continue
 
-        success, msg = process_image(img_path, out_path, args, debug_dir)
+        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir)
         if success:
             ok += 1
             print(f"[OK] {msg}")
@@ -537,10 +730,24 @@ def main():
             fail += 1
             print(f"[FAIL] {msg}")
 
+        if args.ocr_csv and not args.dry_run:
+            ocr_rows.append({"filename": out_name, "ocr_text": ocr_inline if success else ""})
+
     if not args.dry_run:
         print(f"\n[DONE] {ok} succeeded, {fail} failed -> {output_dir}")
         if args.debug and debug_dir:
             print(f"[DEBUG] Overlays saved in -> {debug_dir}")
+
+        if args.ocr_csv:
+            csv_path = Path(args.ocr_csv)
+            if not csv_path.is_absolute():
+                csv_path = output_dir / csv_path
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["filename", "ocr_text"])
+                w.writeheader()
+                w.writerows(ocr_rows)
+            print(f"[OCR] CSV saved -> {csv_path}")
 
 
 if __name__ == "__main__":
