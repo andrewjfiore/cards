@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import csv
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -91,6 +92,14 @@ def parse_args():
                    help="Extra margin around OCR text boxes as fraction of card short side")
     p.add_argument("--ocr-csv", default="",
                    help="Optional CSV path to save OCR text per output file (filename + inline text string)")
+    p.add_argument("--ml-refine", action="store_true",
+                   help="Use CLIP image-text recognition (GPU when available) to improve candidate ranking")
+    p.add_argument("--ml-model", default="openai/clip-vit-base-patch32",
+                   help="HuggingFace CLIP model id used for semantic card scoring")
+    p.add_argument("--ml-device", default="auto", choices=["auto", "cpu", "cuda"],
+                   help="Device for ML scorer (default: auto)")
+    p.add_argument("--ml-weight", type=float, default=0.40,
+                   help="Blend weight [0..1] for CLIP semantic score in final ranking")
     return p.parse_args()
 
 
@@ -260,6 +269,77 @@ def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_fr
     refined[:, 0] = np.clip(refined[:, 0], 0, iw - 1)
     refined[:, 1] = np.clip(refined[:, 1], 0, ih - 1)
     return refined.reshape(4, 1, 2).astype(np.float32), True
+
+
+# ---------------------------------------------------------------------------
+# ML semantic scorer (CLIP; GPU-capable)
+# ---------------------------------------------------------------------------
+_CLIP_SCORER_CACHE = {}
+
+
+def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"):
+    """Return a callable that scores how likely an image patch is a baseball card."""
+    key = (model_id, device)
+    if key in _CLIP_SCORER_CACHE:
+        return _CLIP_SCORER_CACHE[key]
+
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None:
+        _CLIP_SCORER_CACHE[key] = None
+        return None
+
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
+    if device == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        dev = device
+    if dev == "cuda" and not torch.cuda.is_available():
+        dev = "cpu"
+
+    try:
+        processor = CLIPProcessor.from_pretrained(model_id)
+        model = CLIPModel.from_pretrained(model_id)
+    except Exception:
+        _CLIP_SCORER_CACHE[key] = None
+        return None
+
+    model.eval()
+    model.to(dev)
+
+    prompts = [
+        "a close-up photo of a baseball trading card",
+        "a sports card on a table",
+        "a printed baseball card with text and player image",
+        "a wooden tabletop texture",
+        "a plain wooden surface",
+        "wood grain background",
+    ]
+
+    with torch.no_grad():
+        text_inputs = processor(text=prompts, return_tensors="pt", padding=True).to(dev)
+        text_feats = model.get_text_features(**text_inputs)
+        text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
+
+    pos_idx = [0, 1, 2]
+    neg_idx = [3, 4, 5]
+
+    def _score_patch(bgr_img):
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        with torch.no_grad():
+            img_inputs = processor(images=pil, return_tensors="pt").to(dev)
+            img_feats = model.get_image_features(**img_inputs)
+            img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
+
+            sims = (img_feats @ text_feats.T).squeeze(0)
+            pos = float(sims[pos_idx].mean().item())
+            neg = float(sims[neg_idx].mean().item())
+            margin = pos - neg
+            return float(1.0 / (1.0 + np.exp(-6.0 * margin)))
+
+    _CLIP_SCORER_CACHE[key] = _score_patch
+    return _score_patch
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +526,7 @@ def _card_content_score(img, quad):
 # ---------------------------------------------------------------------------
 # Multi-strategy card detection
 # ---------------------------------------------------------------------------
-def detect_card(img):
+def detect_card(img, ml_scorer=None, ml_weight=0.40):
     """
     Try multiple detection strategies to find the card in a phone photo.
     Returns (4-point contour, strategy_name) or (None, None).
@@ -656,7 +736,7 @@ def fix_upside_down(img):
 # ---------------------------------------------------------------------------
 # Image processing pipeline
 # ---------------------------------------------------------------------------
-def process_image(src, dst, args, debug_dir=None):
+def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
     """Process a single image: detect card, warp, orient, resize, save."""
     img = cv2.imread(str(src))
     if img is None:
@@ -673,7 +753,7 @@ def process_image(src, dst, args, debug_dir=None):
         small = img
         scale = 1.0
 
-    contour, strategy = detect_card(small)
+    contour, strategy = detect_card(small, ml_scorer=ml_scorer, ml_weight=args.ml_weight)
     if contour is None:
         # Save failed debug image if requested
         if debug_dir:
@@ -730,7 +810,8 @@ def process_image(src, dst, args, debug_dir=None):
         )
 
     ocr_tag = "+ocr" if ocr_used else ""
-    return True, f"OK ({strategy}{ocr_tag})", _format_ocr_inline(ocr_entries)
+    ml_tag = "+ml" if ml_scorer is not None else ""
+    return True, f"OK ({strategy}{ocr_tag}{ml_tag})", _format_ocr_inline(ocr_entries)
 
 
 def _save_debug_overlay(img, contour, strategy, debug_dir, stem):
@@ -809,7 +890,17 @@ def main():
     print(f"[INFO] Padding: {args.padding}px")
     if args.debug:
         print(f"[INFO] Debug  : ON")
+    if args.ml_refine:
+        print(f"[INFO] ML     : requested (weight={args.ml_weight:.2f})")
     print()
+
+    ml_scorer = None
+    if args.ml_refine:
+        ml_scorer = _get_clip_card_scorer(args.ml_model, args.ml_device)
+        if ml_scorer is None:
+            print("[WARN] ML refine requested but CLIP dependencies/model are unavailable; continuing without ML")
+        else:
+            print(f"[INFO] ML scorer: ON ({args.ml_model} on {args.ml_device})")
 
     ok = fail = 0
     ocr_rows = []
@@ -823,7 +914,7 @@ def main():
             print("[DRY RUN]")
             continue
 
-        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir)
+        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir, ml_scorer=ml_scorer)
         if success:
             ok += 1
             print(f"[OK] {msg}")
