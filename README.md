@@ -48,10 +48,7 @@ Useful options:
 - `--ml-model` HuggingFace CLIP model id (default: `openai/clip-vit-base-patch32`)
 - `--ml-device` `auto|cpu|cuda`
 - `--ml-weight` blending weight for ML semantic score in final candidate ranking
-- `--ml-required` exits with error if ML model/dependencies cannot be loaded
 
 Notes:
 - This is optional and falls back to geometry/content heuristics if `torch`/`transformers`/model weights are unavailable.
-- Use `--ml-required` if you want the run to fail instead of silently falling back.
 - When CUDA is available, CLIP inference runs on GPU.
-- In logs, successful ML-enabled crops include `+ml` in the per-image status line.
