@@ -34,5 +34,24 @@ Options:
 - `--ocr-text-margin` extra border around OCR text boxes
 - `--ocr-csv ocr_results.csv` save per-file OCR text as inline string in CSV (`filename`, `ocr_text`)
 
-Implementation uses EasyOCR when installed and automatically enables GPU when `torch.cuda.is_available()` is true. If OCR dependencies are missing (or a card has no detectable text), cropping continues with geometric detection only.
+Implementation uses EasyOCR when installed and automatically enables GPU when `torch.cuda.is_available()` is true. OCR is run on the full source image before crop/warp so refinement has all available text context. If OCR dependencies are missing (or a card has no detectable text), cropping continues with geometric detection only.
 
+## ML semantic re-ranking (GPU-capable)
+
+You can optionally enable CLIP-based semantic scoring to bias detection toward card-like regions and away from wood-table false positives:
+
+```bash
+python card_crop.py --input-dir photos --output-dir output --ml-refine
+```
+
+Useful options:
+- `--ml-model` HuggingFace CLIP model id (default: `openai/clip-vit-base-patch32`)
+- `--ml-device` `auto|cpu|cuda`
+- `--ml-weight` blending weight for ML semantic score in final candidate ranking
+- `--ml-required` exits with error if ML model/dependencies cannot be loaded
+
+Notes:
+- This is optional and falls back to geometry/content heuristics if `torch`/`transformers`/model weights are unavailable.
+- Use `--ml-required` if you want the run to fail instead of silently falling back.
+- When CUDA is available, CLIP inference runs on GPU.
+- In logs, successful ML-enabled crops include `+ml` in the per-image status line.
