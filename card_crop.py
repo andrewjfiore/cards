@@ -344,25 +344,11 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
     """Return a callable that scores how likely an image patch is a baseball card."""
     key = (model_id, device)
     if key in _CLIP_SCORER_CACHE:
-        return _CLIP_SCORER_CACHE[key], _CLIP_SCORER_STATUS.get(key, {})
+        return _CLIP_SCORER_CACHE[key]
 
-    status = {
-        "enabled": False,
-        "requested_device": device,
-        "runtime_device": None,
-        "reason": "",
-    }
-
-    if importlib.util.find_spec("torch") is None:
-        status["reason"] = "Missing dependency: torch"
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None:
         _CLIP_SCORER_CACHE[key] = None
-        _CLIP_SCORER_STATUS[key] = status
-        return None, status
-    if importlib.util.find_spec("transformers") is None:
-        status["reason"] = "Missing dependency: transformers"
-        _CLIP_SCORER_CACHE[key] = None
-        _CLIP_SCORER_STATUS[key] = status
-        return None, status
+        return None
 
     import torch
     from transformers import CLIPModel, CLIPProcessor
@@ -373,25 +359,15 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
         dev = device
     if dev == "cuda" and not torch.cuda.is_available():
         dev = "cpu"
-        status["reason"] = "CUDA requested but unavailable; fell back to CPU"
 
     try:
         processor = CLIPProcessor.from_pretrained(model_id)
-        # Prefer safetensors to avoid torch.load CVE-related restrictions on
-        # older torch versions.
-        model = CLIPModel.from_pretrained(model_id, use_safetensors=True)
-    except Exception:
-        try:
-            # Fallback for repos that may not provide safetensors.
-            model = CLIPModel.from_pretrained(model_id)
-        except Exception as second_err:
-            msg = str(second_err)
-            if "torch to at least v2.6" in msg or "CVE-2025-32434" in msg:
-                msg += " (tip: upgrade torch>=2.6 or use safetensors-only model files)"
-            status["reason"] = f"Could not load model '{model_id}': {msg}"
-            _CLIP_SCORER_CACHE[key] = None
-            _CLIP_SCORER_STATUS[key] = status
-            return None, status
+        model = CLIPModel.from_pretrained(model_id)
+    except Exception as e:
+        status["reason"] = f"Could not load model '{model_id}': {e}"
+        _CLIP_SCORER_CACHE[key] = None
+        _CLIP_SCORER_STATUS[key] = status
+        return None, status
 
     model.eval()
     model.to(dev)
@@ -923,10 +899,6 @@ def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
     if debug_dir:
         _save_debug_overlay(img, contour, strategy, debug_dir, src.stem)
 
-    # Keep a local alias for merge-safety: older branches used `ocr_entries`
-    # at this return site.
-    ocr_entries = full_ocr_entries
-
     ocr_tag = "+ocr" if ocr_used else ""
     ml_tag = "+ml" if ml_scorer is not None else ""
     return True, f"OK ({strategy}{ocr_tag}{ml_tag})", _format_ocr_inline(ocr_entries)
@@ -1014,16 +986,12 @@ def main():
     print()
 
     ml_scorer = None
-    ml_status = {}
     if args.ml_refine:
-        ml_scorer, ml_status = _get_clip_card_scorer(args.ml_model, args.ml_device)
+        ml_scorer = _get_clip_card_scorer(args.ml_model, args.ml_device)
         if ml_scorer is None:
-            print(f"[WARN] ML refine unavailable: {ml_status.get('reason', 'unknown reason')}")
-            if args.ml_required:
-                print("[ERROR] --ml-required was set and ML could not be enabled")
-                sys.exit(2)
+            print("[WARN] ML refine requested but CLIP dependencies/model are unavailable; continuing without ML")
         else:
-            print(f"[INFO] ML scorer: ON ({args.ml_model} on {ml_status.get('runtime_device', args.ml_device)})")
+            print(f"[INFO] ML scorer: ON ({args.ml_model} on {args.ml_device})")
 
     ok = fail = 0
     ocr_rows = []
