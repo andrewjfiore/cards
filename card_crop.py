@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import csv
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -81,6 +82,11 @@ def parse_args():
     p.add_argument("--debug", action="store_true",
                    help="Save debug images showing detected contour")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--interactive", dest="interactive", action="store_true",
+                   help="Prompt for OCR/ML/GPU and debug options before processing (default: on in TTY)")
+    p.add_argument("--no-interactive", dest="interactive", action="store_false",
+                   help="Disable interactive prompts and run from flags only")
+    p.set_defaults(interactive=True)
     p.add_argument("--ocr-refine", action="store_true",
                    help="Use GPU-accelerated OCR (EasyOCR when available) to expand crop bounds so detected text is inside")
     p.add_argument("--ocr-min-conf", type=float, default=0.25,
@@ -91,7 +97,71 @@ def parse_args():
                    help="Extra margin around OCR text boxes as fraction of card short side")
     p.add_argument("--ocr-csv", default="",
                    help="Optional CSV path to save OCR text per output file (filename + inline text string)")
+    p.add_argument("--ml-refine", action="store_true",
+                   help="Use CLIP image-text recognition (GPU when available) to improve candidate ranking")
+    p.add_argument("--ml-model", default="openai/clip-vit-base-patch32",
+                   help="HuggingFace CLIP model id used for semantic card scoring")
+    p.add_argument("--ml-device", default="auto", choices=["auto", "cpu", "cuda"],
+                   help="Device for ML scorer (default: auto)")
+    p.add_argument("--ml-weight", type=float, default=0.40,
+                   help="Blend weight [0..1] for CLIP semantic score in final ranking")
+    p.add_argument("--ml-required", action="store_true",
+                   help="Fail fast if --ml-refine is requested but CLIP could not be loaded")
     return p.parse_args()
+
+
+def _ask_yes_no(prompt, default=False):
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    while True:
+        raw = input(prompt + suffix).strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def _ask_float(prompt, default):
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print("Invalid number; using default.")
+        return default
+
+
+def apply_interactive_options(args):
+    """Interactive setup for common OCR/ML options."""
+    if not args.interactive:
+        return args
+
+    if not sys.stdin.isatty():
+        print("[WARN] --interactive requested but no TTY is available; skipping prompts")
+        return args
+
+    print("\n[SETUP] Interactive options")
+    print("Choose optional features for this run. Press Enter to accept defaults.\n")
+
+    args.ocr_refine = _ask_yes_no("Enable OCR crop expansion", default=args.ocr_refine)
+    if args.ocr_refine:
+        args.ocr_min_conf = _ask_float("OCR minimum confidence", args.ocr_min_conf)
+        args.ocr_text_margin = _ask_float("OCR text margin fraction", args.ocr_text_margin)
+
+    args.ml_refine = _ask_yes_no("Enable ML (CLIP) semantic reranking", default=args.ml_refine)
+    if args.ml_refine:
+        use_gpu = _ask_yes_no("Use GPU for ML if available", default=(args.ml_device in {"auto", "cuda"}))
+        args.ml_device = "cuda" if use_gpu else "cpu"
+        args.ml_weight = _ask_float("ML blend weight (0..1)", args.ml_weight)
+        args.ml_required = _ask_yes_no("Fail if ML cannot be enabled", default=args.ml_required)
+
+    args.debug = _ask_yes_no("Save debug overlays", default=args.debug)
+    args.ocr_csv = "ocr_results.csv" if _ask_yes_no("Write OCR CSV", default=bool(args.ocr_csv)) else ""
+    print()
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +272,10 @@ def _format_ocr_inline(entries):
     return " | ".join(chunks)
 
 
-def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_frac=0.03):
+def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_frac=0.03, entries=None):
     """Expand card quad so OCR-detected text near the card remains inside bounds."""
-    entries = _detect_text_entries(img, min_conf=min_conf, max_dim=max_dim)
+    if entries is None:
+        entries = _detect_text_entries(img, min_conf=min_conf, max_dim=max_dim)
     boxes = [e["box"] for e in entries]
     if not boxes:
         return quad, False
@@ -260,6 +331,109 @@ def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_fr
     refined[:, 0] = np.clip(refined[:, 0], 0, iw - 1)
     refined[:, 1] = np.clip(refined[:, 1], 0, ih - 1)
     return refined.reshape(4, 1, 2).astype(np.float32), True
+
+
+# ---------------------------------------------------------------------------
+# ML semantic scorer (CLIP; GPU-capable)
+# ---------------------------------------------------------------------------
+_CLIP_SCORER_CACHE = {}
+_CLIP_SCORER_STATUS = {}
+
+
+def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"):
+    """Return a callable that scores how likely an image patch is a baseball card."""
+    key = (model_id, device)
+    if key in _CLIP_SCORER_CACHE:
+        return _CLIP_SCORER_CACHE[key], _CLIP_SCORER_STATUS.get(key, {})
+
+    status = {
+        "enabled": False,
+        "requested_device": device,
+        "runtime_device": None,
+        "reason": "",
+    }
+
+    if importlib.util.find_spec("torch") is None:
+        status["reason"] = "Missing dependency: torch"
+        _CLIP_SCORER_CACHE[key] = None
+        _CLIP_SCORER_STATUS[key] = status
+        return None, status
+    if importlib.util.find_spec("transformers") is None:
+        status["reason"] = "Missing dependency: transformers"
+        _CLIP_SCORER_CACHE[key] = None
+        _CLIP_SCORER_STATUS[key] = status
+        return None, status
+
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
+    if device == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        dev = device
+    if dev == "cuda" and not torch.cuda.is_available():
+        dev = "cpu"
+        status["reason"] = "CUDA requested but unavailable; fell back to CPU"
+
+    try:
+        processor = CLIPProcessor.from_pretrained(model_id)
+        # Prefer safetensors to avoid torch.load CVE-related restrictions on
+        # older torch versions.
+        model = CLIPModel.from_pretrained(model_id, use_safetensors=True)
+    except Exception:
+        try:
+            # Fallback for repos that may not provide safetensors.
+            model = CLIPModel.from_pretrained(model_id)
+        except Exception as second_err:
+            msg = str(second_err)
+            if "torch to at least v2.6" in msg or "CVE-2025-32434" in msg:
+                msg += " (tip: upgrade torch>=2.6 or use safetensors-only model files)"
+            status["reason"] = f"Could not load model '{model_id}': {msg}"
+            _CLIP_SCORER_CACHE[key] = None
+            _CLIP_SCORER_STATUS[key] = status
+            return None, status
+
+    model.eval()
+    model.to(dev)
+    status["enabled"] = True
+    status["runtime_device"] = dev
+    if not status["reason"]:
+        status["reason"] = "loaded"
+
+    prompts = [
+        "a close-up photo of a baseball trading card",
+        "a sports card on a table",
+        "a printed baseball card with text and player image",
+        "a wooden tabletop texture",
+        "a plain wooden surface",
+        "wood grain background",
+    ]
+
+    with torch.no_grad():
+        text_inputs = processor(text=prompts, return_tensors="pt", padding=True).to(dev)
+        text_feats = model.get_text_features(**text_inputs)
+        text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
+
+    pos_idx = [0, 1, 2]
+    neg_idx = [3, 4, 5]
+
+    def _score_patch(bgr_img):
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        with torch.no_grad():
+            img_inputs = processor(images=pil, return_tensors="pt").to(dev)
+            img_feats = model.get_image_features(**img_inputs)
+            img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
+
+            sims = (img_feats @ text_feats.T).squeeze(0)
+            pos = float(sims[pos_idx].mean().item())
+            neg = float(sims[neg_idx].mean().item())
+            margin = pos - neg
+            return float(1.0 / (1.0 + np.exp(-6.0 * margin)))
+
+    _CLIP_SCORER_CACHE[key] = _score_patch
+    _CLIP_SCORER_STATUS[key] = status
+    return _score_patch, status
 
 
 # ---------------------------------------------------------------------------
@@ -396,10 +570,57 @@ def _morph_variants(mask, close_sizes=(11, 15, 21), open_sizes=(7, 11)):
     return variants
 
 
+def _card_content_score(img, quad):
+    """
+    Score how card-like the warped quad content looks.
+
+    Geometric scoring can still select wood-table patches that happen to be
+    roughly rectangular and card-sized. This secondary score prefers regions
+    with printed-card characteristics: fine detail/edges plus some color
+    richness.
+    """
+    warped = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
+    if warped is None:
+        return 0.0
+
+    h, w = warped.shape[:2]
+    if h < 24 or w < 24:
+        return 0.0
+
+    # Normalize scale so texture metrics are comparable across candidates.
+    short_side = min(h, w)
+    scale = 220.0 / short_side
+    norm = cv2.resize(
+        warped,
+        (max(24, int(round(w * scale))), max(24, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    gray = cv2.cvtColor(norm, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(norm, cv2.COLOR_BGR2HSV)
+
+    # Fine printed text/art yields stronger local gradients than wood grain.
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+    lap_score = float(np.clip(np.log1p(lap_var) / 6.0, 0.0, 1.0))
+
+    # Edge density in a card is usually moderate to high because of text,
+    # player contours, logos, stat blocks, etc.
+    edges = cv2.Canny(gray, 70, 160)
+    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
+    edge_score = float(np.clip(edge_density / 0.11, 0.0, 1.0))
+
+    # Cards are often more saturated than wood, but keep this weight lower
+    # so low-saturation vintage cards are not rejected.
+    sat_mean = float(hsv[:, :, 1].mean()) / 255.0
+    sat_score = float(np.clip((sat_mean - 0.08) / 0.24, 0.0, 1.0))
+
+    return 0.45 * lap_score + 0.35 * edge_score + 0.20 * sat_score
+
+
 # ---------------------------------------------------------------------------
 # Multi-strategy card detection
 # ---------------------------------------------------------------------------
-def detect_card(img):
+def detect_card(img, ml_scorer=None, ml_weight=0.40):
     """
     Try multiple detection strategies to find the card in a phone photo.
     Returns (4-point contour, strategy_name) or (None, None).
@@ -554,29 +775,45 @@ def detect_card(img):
         return None, None
 
     # ------------------------------------------------------------------
-    # Candidate selection with area-reasonableness filter.
-    # Background-region detections (from inverse masks) can cover 50%+
-    # of the image and produce wildly wrong area.  If the top candidate
-    # is that large, prefer a high-scoring alternative with smaller area.
+    # Candidate selection with geometry + content scoring.
+    # Geometry can still pick table rectangles; add a card-content score
+    # from the warped candidate and combine both signals.
     # ------------------------------------------------------------------
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_quad, strategy = candidates[0]
+    ranked = []
+    ml_weight = float(np.clip(ml_weight, 0.0, 1.0)) if ml_scorer is not None else 0.0
 
-    best_area_frac = cv2.contourArea(
-        best_quad.reshape(-1, 1, 2).astype(np.float32)
-    ) / img_area
+    # Limit expensive ML scoring to strongest geometric candidates.
+    geom_sorted = sorted(candidates, key=lambda x: x[0], reverse=True)
+    ml_limit = min(32, len(geom_sorted))
 
-    if best_area_frac > 0.45 and strategy != "full_frame":
-        for sc, quad, strat in candidates[1:]:
-            if sc < best_score * 0.70:
-                break  # remaining candidates are too weak
-            qarea = cv2.contourArea(
-                quad.reshape(-1, 1, 2).astype(np.float32)
-            ) / img_area
-            if 0.02 <= qarea <= 0.45:
-                best_quad, strategy = quad, strat
-                break
+    for idx, (geom_score, quad, strat) in enumerate(geom_sorted):
+        area_frac = cv2.contourArea(
+            quad.reshape(-1, 1, 2).astype(np.float32)
+        ) / img_area
 
+        content_score = _card_content_score(img, quad)
+        base_score = 0.72 * geom_score + 0.28 * content_score
+
+        ml_score = base_score
+        if ml_scorer is not None and idx < ml_limit:
+            patch = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
+            if patch is not None and min(patch.shape[:2]) >= 24:
+                try:
+                    ml_score = ml_scorer(patch)
+                except Exception:
+                    ml_score = base_score
+
+        final_score = (1.0 - ml_weight) * base_score + ml_weight * ml_score
+
+        # Large non-frame regions are often background leakage from inverse
+        # masks. Keep them available but with a clear penalty.
+        if area_frac > 0.45 and strat != "full_frame":
+            final_score -= 0.12
+
+        ranked.append((final_score, geom_score, content_score, ml_score, quad, strat, area_frac))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    _, _, _, _, best_quad, strategy, _ = ranked[0]
     return best_quad, strategy
 
 
@@ -610,13 +847,23 @@ def fix_upside_down(img):
 # ---------------------------------------------------------------------------
 # Image processing pipeline
 # ---------------------------------------------------------------------------
-def process_image(src, dst, args, debug_dir=None):
+def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
     """Process a single image: detect card, warp, orient, resize, save."""
     img = cv2.imread(str(src))
     if img is None:
         return False, "Could not read image", ""
 
     oh, ow = img.shape[:2]
+
+    # OCR pass on the full image before any crop/warp so refinement and CSV
+    # can use all available text context.
+    full_ocr_entries = []
+    if args.ocr_refine or args.ocr_csv:
+        full_ocr_entries = _detect_text_entries(
+            img,
+            min_conf=args.ocr_min_conf,
+            max_dim=args.ocr_max_dim,
+        )
 
     # Downscale for faster detection on large phone photos
     if max(oh, ow) > DETECT_MAX_DIM:
@@ -627,7 +874,7 @@ def process_image(src, dst, args, debug_dir=None):
         small = img
         scale = 1.0
 
-    contour, strategy = detect_card(small)
+    contour, strategy = detect_card(small, ml_scorer=ml_scorer, ml_weight=args.ml_weight)
     if contour is None:
         # Save failed debug image if requested
         if debug_dir:
@@ -647,6 +894,7 @@ def process_image(src, dst, args, debug_dir=None):
             min_conf=args.ocr_min_conf,
             max_dim=args.ocr_max_dim,
             text_margin_frac=args.ocr_text_margin,
+            entries=full_ocr_entries,
         )
 
     # Perspective warp on full-resolution image
@@ -675,16 +923,13 @@ def process_image(src, dst, args, debug_dir=None):
     if debug_dir:
         _save_debug_overlay(img, contour, strategy, debug_dir, src.stem)
 
-    ocr_entries = []
-    if args.ocr_refine or args.ocr_csv:
-        ocr_entries = _detect_text_entries(
-            warped,
-            min_conf=args.ocr_min_conf,
-            max_dim=args.ocr_max_dim,
-        )
+    # Keep a local alias for merge-safety: older branches used `ocr_entries`
+    # at this return site.
+    ocr_entries = full_ocr_entries
 
     ocr_tag = "+ocr" if ocr_used else ""
-    return True, f"OK ({strategy}{ocr_tag})", _format_ocr_inline(ocr_entries)
+    ml_tag = "+ml" if ml_scorer is not None else ""
+    return True, f"OK ({strategy}{ocr_tag}{ml_tag})", _format_ocr_inline(ocr_entries)
 
 
 def _save_debug_overlay(img, contour, strategy, debug_dir, stem):
@@ -736,6 +981,7 @@ def collect_images(input_dir, extensions):
 
 def main():
     args = parse_args()
+    args = apply_interactive_options(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     extensions = [e.strip().lstrip(".") for e in args.ext.split(",")]
@@ -763,7 +1009,21 @@ def main():
     print(f"[INFO] Padding: {args.padding}px")
     if args.debug:
         print(f"[INFO] Debug  : ON")
+    if args.ml_refine:
+        print(f"[INFO] ML     : requested (weight={args.ml_weight:.2f})")
     print()
+
+    ml_scorer = None
+    ml_status = {}
+    if args.ml_refine:
+        ml_scorer, ml_status = _get_clip_card_scorer(args.ml_model, args.ml_device)
+        if ml_scorer is None:
+            print(f"[WARN] ML refine unavailable: {ml_status.get('reason', 'unknown reason')}")
+            if args.ml_required:
+                print("[ERROR] --ml-required was set and ML could not be enabled")
+                sys.exit(2)
+        else:
+            print(f"[INFO] ML scorer: ON ({args.ml_model} on {ml_status.get('runtime_device', args.ml_device)})")
 
     ok = fail = 0
     ocr_rows = []
@@ -777,7 +1037,7 @@ def main():
             print("[DRY RUN]")
             continue
 
-        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir)
+        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir, ml_scorer=ml_scorer)
         if success:
             ok += 1
             print(f"[OK] {msg}")
