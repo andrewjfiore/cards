@@ -308,8 +308,15 @@ def _score_contour(cnt, img_area, img_shape):
     # Aspect-ratio closeness to ideal 1.4
     aspect_score = max(0.0, 1.0 - abs(aspect - CARD_ASPECT) / 0.55)
 
-    # Larger contours are likely cards, but don't over-prefer size.
-    size_score = min(1.0, (area / img_area) / 0.12)
+    # Prefer contours in the typical card-area range; penalise very
+    # large contours (likely background from inverse masks).
+    area_frac = area / img_area
+    if area_frac < 0.12:
+        size_score = area_frac / 0.12
+    elif area_frac <= 0.45:
+        size_score = 1.0
+    else:
+        size_score = max(0.15, 1.0 - (area_frac - 0.45) / 0.20)
 
     ih, iw = img_shape
     M = cv2.moments(cnt)
@@ -333,11 +340,13 @@ def _score_contour(cnt, img_area, img_shape):
     border_penalty = 0.05 if (touches_border and size_score < 0.65) else 0.0
 
     score = (
-        aspect_score    * 0.35
-        + rectangularity * 0.30
-        + size_score     * 0.15
+        aspect_score    * 0.30
+        + rectangularity * 0.25
+        + size_score     * 0.10
+        + center_score   * 0.10
         + solidity       * 0.05
         + (0.15 if has_four else 0.0)
+        - border_penalty
     )
 
     # Build the 4-point output
@@ -366,10 +375,10 @@ def _collect_candidates(contours, img_area, img_shape):
     return results
 
 
-def _add_mask_candidates(mask, img_area, candidates, strategy_name):
+def _add_mask_candidates(mask, img_area, candidates, strategy_name, img_shape=None):
     """Extract contour candidates from a binary mask and append scored quads."""
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for sc, quad in _collect_candidates(cnts, img_area):
+    for sc, quad in _collect_candidates(cnts, img_area, img_shape):
         candidates.append((sc, quad, strategy_name))
 
 
@@ -416,11 +425,11 @@ def detect_card(img):
             closed, cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
         )
-        _add_mask_candidates(closed, img_area, candidates, f"canny({lo},{hi})")
+        _add_mask_candidates(closed, img_area, candidates, f"canny({lo},{hi})", img_shape)
 
         # Inverse canny mask can isolate lighter cards on darker woods
         inv = cv2.bitwise_not(closed)
-        _add_mask_candidates(inv, img_area, candidates, f"canny_inv({lo},{hi})")
+        _add_mask_candidates(inv, img_area, candidates, f"canny_inv({lo},{hi})", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 2 — Adaptive threshold
@@ -438,14 +447,14 @@ def detect_card(img):
             for idx, variant in enumerate(_morph_variants(binary)):
                 _add_mask_candidates(
                     variant, img_area, candidates,
-                    f"adapt(b={bsz},C={C})#{idx}"
+                    f"adapt(b={bsz},C={C})#{idx}", img_shape
                 )
 
             inv_binary = cv2.bitwise_not(binary)
             for idx, variant in enumerate(_morph_variants(inv_binary)):
                 _add_mask_candidates(
                     variant, img_area, candidates,
-                    f"adapt_inv(b={bsz},C={C})#{idx}"
+                    f"adapt_inv(b={bsz},C={C})#{idx}", img_shape
                 )
 
     # ------------------------------------------------------------------
@@ -459,10 +468,10 @@ def detect_card(img):
     _, binary3 = cv2.threshold(l_blur, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary3)):
-        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu#{idx}", img_shape)
     inv3 = cv2.bitwise_not(binary3)
     for idx, variant in enumerate(_morph_variants(inv3)):
-        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 4 — Simple grayscale Otsu (fallback)
@@ -471,10 +480,10 @@ def detect_card(img):
     _, binary4 = cv2.threshold(blurred, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary4)):
-        _add_mask_candidates(variant, img_area, candidates, f"otsu#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"otsu#{idx}", img_shape)
     inv4 = cv2.bitwise_not(binary4)
     for idx, variant in enumerate(_morph_variants(inv4)):
-        _add_mask_candidates(variant, img_area, candidates, f"otsu_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"otsu_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 5 — HSV saturation + Otsu
@@ -488,10 +497,10 @@ def detect_card(img):
     _, binary5 = cv2.threshold(s_blur, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary5)):
-        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat#{idx}", img_shape)
     inv5 = cv2.bitwise_not(binary5)
     for idx, variant in enumerate(_morph_variants(inv5)):
-        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 6 — Median blur + Otsu
@@ -502,10 +511,10 @@ def detect_card(img):
     _, binary6 = cv2.threshold(median, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary6)):
-        _add_mask_candidates(variant, img_area, candidates, f"median+otsu#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"median+otsu#{idx}", img_shape)
     inv6 = cv2.bitwise_not(binary6)
     for idx, variant in enumerate(_morph_variants(inv6)):
-        _add_mask_candidates(variant, img_area, candidates, f"median+otsu_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"median+otsu_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 7 — Scharr gradient magnitude
@@ -520,14 +529,54 @@ def detect_card(img):
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary7, close_sizes=(9, 13, 17),
                                                   open_sizes=(5, 9))):
-        _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}", img_shape)
+
+    # ------------------------------------------------------------------
+    # Full-frame candidate — if the image aspect ratio matches a card,
+    # inject the image boundary as a moderate-score candidate.  In
+    # normal photos real card contours outscore it; in re-crops (where
+    # only internal features are detected) it wins as a tiebreaker.
+    # ------------------------------------------------------------------
+    frame_aspect = max(h, w) / max(1, min(h, w))
+    if ASPECT_LO <= frame_aspect <= ASPECT_HI:
+        frame_aspect_score = max(0.0, 1.0 - abs(frame_aspect - CARD_ASPECT) / 0.55)
+        # Moderate score: beats weak internal features, loses to real
+        # card contours in card-on-table photos.
+        frame_score = 0.35 + 0.20 * frame_aspect_score
+        m = 4
+        frame_quad = np.array([
+            [[m, m]], [[w - 1 - m, m]],
+            [[w - 1 - m, h - 1 - m]], [[m, h - 1 - m]]
+        ], dtype=np.int32)
+        candidates.append((frame_score, frame_quad, "full_frame"))
 
     if not candidates:
         return None, None
 
-    # Pick the highest-scoring candidate
+    # ------------------------------------------------------------------
+    # Candidate selection with area-reasonableness filter.
+    # Background-region detections (from inverse masks) can cover 50%+
+    # of the image and produce wildly wrong area.  If the top candidate
+    # is that large, prefer a high-scoring alternative with smaller area.
+    # ------------------------------------------------------------------
     candidates.sort(key=lambda x: x[0], reverse=True)
-    _, best_quad, strategy = candidates[0]
+    best_score, best_quad, strategy = candidates[0]
+
+    best_area_frac = cv2.contourArea(
+        best_quad.reshape(-1, 1, 2).astype(np.float32)
+    ) / img_area
+
+    if best_area_frac > 0.45 and strategy != "full_frame":
+        for sc, quad, strat in candidates[1:]:
+            if sc < best_score * 0.70:
+                break  # remaining candidates are too weak
+            qarea = cv2.contourArea(
+                quad.reshape(-1, 1, 2).astype(np.float32)
+            ) / img_area
+            if 0.02 <= qarea <= 0.45:
+                best_quad, strategy = quad, strat
+                break
+
     return best_quad, strategy
 
 

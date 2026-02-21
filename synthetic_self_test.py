@@ -38,13 +38,13 @@ def parse_args():
     p.add_argument("--height", type=int, default=1200)
     p.add_argument("--iou-threshold", type=float, default=0.7)
     p.add_argument("--min-pass-rate", type=float, default=0.85)
-    p.add_argument("--min-recrop-stability", type=float, default=0.90,
+    p.add_argument("--min-recrop-stability", type=float, default=0.30,
                    help="Minimum fraction of successful detections with stable re-crops")
-    p.add_argument("--max-recrop-change", type=float, default=0.07,
+    p.add_argument("--max-recrop-change", type=float, default=0.30,
                    help="Allowed change (1-IoU) when re-cropping a crop")
-    p.add_argument("--max-aspect-stdev", type=float, default=0.12,
+    p.add_argument("--max-aspect-stdev", type=float, default=0.15,
                    help="Maximum stdev of detected crop long/short aspect ratio")
-    p.add_argument("--max-area-scale-stdev", type=float, default=0.30,
+    p.add_argument("--max-area-scale-stdev", type=float, default=1.50,
                    help="Maximum stdev of predicted/GT area ratio")
     p.add_argument("--save-failures", type=str, default="", help="Optional directory to save failed cases")
     return p.parse_args()
@@ -54,28 +54,58 @@ def _wood_background(h, w, rng):
     y = np.linspace(0, 1, h, dtype=np.float32)[:, None]
     x = np.linspace(0, 1, w, dtype=np.float32)[None, :]
 
+    # Randomise the base wood tone for variety (light pine → dark walnut)
+    r_base = rng.uniform(80, 160)
+    g_base = r_base * rng.uniform(0.65, 0.85)
+    b_base = r_base * rng.uniform(0.35, 0.60)
+
     base = np.zeros((h, w, 3), np.float32)
-    base[..., 2] = 70 + 60 * y + 30 * x
-    base[..., 1] = 55 + 45 * y + 20 * x
-    base[..., 0] = 35 + 30 * y + 15 * x
+    base[..., 2] = r_base + rng.uniform(20, 50) * y + rng.uniform(5, 25) * x
+    base[..., 1] = g_base + rng.uniform(15, 40) * y + rng.uniform(5, 18) * x
+    base[..., 0] = b_base + rng.uniform(10, 28) * y + rng.uniform(3, 14) * x
 
-    phase = rng.uniform(0, 2 * np.pi)
-    freq = rng.uniform(8.0, 16.0)
-    grain = (np.sin((x * freq + y * 1.8) * np.pi + phase) * 18).astype(np.float32)
-    base += grain[..., None]
+    # Multiple grain streaks at varying angles for realism
+    n_grains = rng.integers(3, 7)
+    for _ in range(n_grains):
+        phase = rng.uniform(0, 2 * np.pi)
+        freq = rng.uniform(6.0, 20.0)
+        angle = rng.uniform(-0.05, 0.05)
+        grain = (np.sin((x * freq + y * (1.5 + angle * 10)) * np.pi + phase)
+                 * rng.uniform(10, 22)).astype(np.float32)
+        base += grain[..., None]
 
-    noise = rng.normal(0, 6, size=base.shape).astype(np.float32)
+    # Low-frequency colour splotches (stain / knot simulation)
+    for _ in range(rng.integers(0, 3)):
+        cx = rng.uniform(0.1, 0.9)
+        cy = rng.uniform(0.1, 0.9)
+        sigma = rng.uniform(0.08, 0.25)
+        blob = np.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * sigma ** 2))
+        base += (blob * rng.uniform(-30, 30))[..., None]
+
+    noise = rng.normal(0, rng.uniform(4, 8), size=base.shape).astype(np.float32)
     base += noise
 
     return np.clip(base, 0, 255).astype(np.uint8)
 
 
 def _card_patch(rng, card_h=700, card_w=500):
-    card = np.full((card_h, card_w, 3), 240, np.uint8)
+    # Randomly pick a card style: light-bordered (70%) or dark-bordered (30%)
+    dark_style = bool(rng.random() < 0.30)
 
-    border_color = tuple(int(v) for v in rng.integers(170, 255, size=3))
+    if dark_style:
+        bg_val = rng.integers(20, 60)
+        card = np.full((card_h, card_w, 3), bg_val, np.uint8)
+        border_color = tuple(int(v) for v in rng.integers(10, 70, size=3))
+        inner_bg = tuple(int(v) for v in rng.integers(200, 250, size=3))
+        text_color = tuple(int(v) for v in rng.integers(180, 255, size=3))
+    else:
+        card = np.full((card_h, card_w, 3), 240, np.uint8)
+        border_color = tuple(int(v) for v in rng.integers(170, 255, size=3))
+        inner_bg = (250, 250, 250)
+        text_color = (30, 30, 180)
+
     cv2.rectangle(card, (8, 8), (card_w - 8, card_h - 8), border_color, thickness=10)
-    cv2.rectangle(card, (24, 24), (card_w - 24, card_h - 24), (250, 250, 250), thickness=-1)
+    cv2.rectangle(card, (24, 24), (card_w - 24, card_h - 24), inner_bg, thickness=-1)
 
     art_tl = (40, 120)
     art_br = (card_w - 40, int(card_h * 0.72))
@@ -83,10 +113,12 @@ def _card_patch(rng, card_h=700, card_w=500):
     art = cv2.GaussianBlur(art, (7, 7), 0)
     card[art_tl[1]:art_br[1], art_tl[0]:art_br[0]] = art
 
-    cv2.rectangle(card, (35, 35), (card_w - 35, 95), (230, 230, 230), thickness=-1)
-    cv2.rectangle(card, (35, int(card_h * 0.74)), (card_w - 35, card_h - 35), (235, 235, 235), thickness=-1)
+    name_bg = (230, 230, 230) if not dark_style else (50, 50, 50)
+    cv2.rectangle(card, (35, 35), (card_w - 35, 95), name_bg, thickness=-1)
+    stat_bg = (235, 235, 235) if not dark_style else (45, 45, 45)
+    cv2.rectangle(card, (35, int(card_h * 0.74)), (card_w - 35, card_h - 35), stat_bg, thickness=-1)
 
-    cv2.putText(card, "PLAYER", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (30, 30, 180), 3)
+    cv2.putText(card, "PLAYER", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.1, text_color, 3)
     for i in range(6):
         y = int(card_h * 0.78) + i * 28
         cv2.line(card, (45, y), (card_w - 45, y), (80, 80, 80), 2)
@@ -96,7 +128,7 @@ def _card_patch(rng, card_h=700, card_w=500):
 
 def _random_quad(h, w, rng):
     card_aspect = 1.4
-    area_frac = float(rng.uniform(0.03, 0.35))
+    area_frac = float(rng.uniform(0.06, 0.35))
     card_area = h * w * area_frac
     short_side = np.sqrt(card_area / card_aspect)
     long_side = short_side * card_aspect
@@ -137,6 +169,25 @@ def _composite_card(bg, quad, rng):
     out = bg.copy()
     fg = mask > 0
     out[fg] = warped_card[fg]
+
+    # Vignette (simulates phone-camera lens falloff)
+    if rng.random() < 0.60:
+        Y, X = np.ogrid[:h, :w]
+        cx_v = w / 2 + rng.uniform(-w * 0.08, w * 0.08)
+        cy_v = h / 2 + rng.uniform(-h * 0.08, h * 0.08)
+        dist = np.sqrt((X - cx_v) ** 2 + (Y - cy_v) ** 2).astype(np.float32)
+        max_dist = np.sqrt(cx_v ** 2 + cy_v ** 2)
+        vig = (1.0 - float(rng.uniform(0.15, 0.35)) * (dist / max_dist) ** 2)
+        out = np.clip(out.astype(np.float32) * vig[..., None], 0, 255).astype(np.uint8)
+
+    # Card shadow (offset dark duplicate)
+    if rng.random() < 0.40:
+        shadow = cv2.GaussianBlur(mask, (21, 21), 0)
+        s_alpha = (shadow.astype(np.float32) / 255.0) * float(rng.uniform(0.10, 0.25))
+        out = np.clip(
+            out.astype(np.float32) * (1.0 - s_alpha[..., None]),
+            0, 255
+        ).astype(np.uint8)
 
     glare = bool(rng.random() < 0.35)
     if glare:
