@@ -686,40 +686,23 @@ def detect_card(img, ml_scorer=None, ml_weight=0.40):
     # from the warped candidate and combine both signals.
     # ------------------------------------------------------------------
     ranked = []
-    ml_weight = float(np.clip(ml_weight, 0.0, 1.0)) if ml_scorer is not None else 0.0
-
-    # Limit expensive ML scoring to strongest geometric candidates.
-    geom_sorted = sorted(candidates, key=lambda x: x[0], reverse=True)
-    ml_limit = min(32, len(geom_sorted))
-
-    for idx, (geom_score, quad, strat) in enumerate(geom_sorted):
+    for geom_score, quad, strat in candidates:
         area_frac = cv2.contourArea(
             quad.reshape(-1, 1, 2).astype(np.float32)
         ) / img_area
 
         content_score = _card_content_score(img, quad)
-        base_score = 0.72 * geom_score + 0.28 * content_score
-
-        ml_score = base_score
-        if ml_scorer is not None and idx < ml_limit:
-            patch = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
-            if patch is not None and min(patch.shape[:2]) >= 24:
-                try:
-                    ml_score = ml_scorer(patch)
-                except Exception:
-                    ml_score = base_score
-
-        final_score = (1.0 - ml_weight) * base_score + ml_weight * ml_score
+        final_score = 0.68 * geom_score + 0.32 * content_score
 
         # Large non-frame regions are often background leakage from inverse
         # masks. Keep them available but with a clear penalty.
         if area_frac > 0.45 and strat != "full_frame":
             final_score -= 0.12
 
-        ranked.append((final_score, geom_score, content_score, ml_score, quad, strat, area_frac))
+        ranked.append((final_score, geom_score, content_score, quad, strat, area_frac))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
-    _, _, _, _, best_quad, strategy, _ = ranked[0]
+    _, _, _, best_quad, strategy, _ = ranked[0]
     return best_quad, strategy
 
 
