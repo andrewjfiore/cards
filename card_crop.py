@@ -366,10 +366,10 @@ def _collect_candidates(contours, img_area, img_shape):
     return results
 
 
-def _add_mask_candidates(mask, img_area, candidates, strategy_name):
+def _add_mask_candidates(mask, img_area, candidates, strategy_name, img_shape=None):
     """Extract contour candidates from a binary mask and append scored quads."""
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for sc, quad in _collect_candidates(cnts, img_area):
+    for sc, quad in _collect_candidates(cnts, img_area, img_shape):
         candidates.append((sc, quad, strategy_name))
 
 
@@ -416,11 +416,11 @@ def detect_card(img):
             closed, cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
         )
-        _add_mask_candidates(closed, img_area, candidates, f"canny({lo},{hi})")
+        _add_mask_candidates(closed, img_area, candidates, f"canny({lo},{hi})", img_shape)
 
         # Inverse canny mask can isolate lighter cards on darker woods
         inv = cv2.bitwise_not(closed)
-        _add_mask_candidates(inv, img_area, candidates, f"canny_inv({lo},{hi})")
+        _add_mask_candidates(inv, img_area, candidates, f"canny_inv({lo},{hi})", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 2 — Adaptive threshold
@@ -438,14 +438,14 @@ def detect_card(img):
             for idx, variant in enumerate(_morph_variants(binary)):
                 _add_mask_candidates(
                     variant, img_area, candidates,
-                    f"adapt(b={bsz},C={C})#{idx}"
+                    f"adapt(b={bsz},C={C})#{idx}", img_shape
                 )
 
             inv_binary = cv2.bitwise_not(binary)
             for idx, variant in enumerate(_morph_variants(inv_binary)):
                 _add_mask_candidates(
                     variant, img_area, candidates,
-                    f"adapt_inv(b={bsz},C={C})#{idx}"
+                    f"adapt_inv(b={bsz},C={C})#{idx}", img_shape
                 )
 
     # ------------------------------------------------------------------
@@ -459,10 +459,10 @@ def detect_card(img):
     _, binary3 = cv2.threshold(l_blur, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary3)):
-        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu#{idx}", img_shape)
     inv3 = cv2.bitwise_not(binary3)
     for idx, variant in enumerate(_morph_variants(inv3)):
-        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 4 — Simple grayscale Otsu (fallback)
@@ -471,10 +471,10 @@ def detect_card(img):
     _, binary4 = cv2.threshold(blurred, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary4)):
-        _add_mask_candidates(variant, img_area, candidates, f"otsu#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"otsu#{idx}", img_shape)
     inv4 = cv2.bitwise_not(binary4)
     for idx, variant in enumerate(_morph_variants(inv4)):
-        _add_mask_candidates(variant, img_area, candidates, f"otsu_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"otsu_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 5 — HSV saturation + Otsu
@@ -488,10 +488,10 @@ def detect_card(img):
     _, binary5 = cv2.threshold(s_blur, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary5)):
-        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat#{idx}", img_shape)
     inv5 = cv2.bitwise_not(binary5)
     for idx, variant in enumerate(_morph_variants(inv5)):
-        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 6 — Median blur + Otsu
@@ -502,10 +502,10 @@ def detect_card(img):
     _, binary6 = cv2.threshold(median, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary6)):
-        _add_mask_candidates(variant, img_area, candidates, f"median+otsu#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"median+otsu#{idx}", img_shape)
     inv6 = cv2.bitwise_not(binary6)
     for idx, variant in enumerate(_morph_variants(inv6)):
-        _add_mask_candidates(variant, img_area, candidates, f"median+otsu_inv#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"median+otsu_inv#{idx}", img_shape)
 
     # ------------------------------------------------------------------
     # Strategy 7 — Scharr gradient magnitude
@@ -520,7 +520,7 @@ def detect_card(img):
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     for idx, variant in enumerate(_morph_variants(binary7, close_sizes=(9, 13, 17),
                                                   open_sizes=(5, 9))):
-        _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}")
+        _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}", img_shape)
 
     if not candidates:
         return None, None
