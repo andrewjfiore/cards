@@ -308,8 +308,15 @@ def _score_contour(cnt, img_area, img_shape):
     # Aspect-ratio closeness to ideal 1.4
     aspect_score = max(0.0, 1.0 - abs(aspect - CARD_ASPECT) / 0.55)
 
-    # Larger contours are likely cards, but don't over-prefer size.
-    size_score = min(1.0, (area / img_area) / 0.12)
+    # Prefer contours in the typical card-area range; penalise very
+    # large contours (likely background from inverse masks).
+    area_frac = area / img_area
+    if area_frac < 0.12:
+        size_score = area_frac / 0.12
+    elif area_frac <= 0.45:
+        size_score = 1.0
+    else:
+        size_score = max(0.15, 1.0 - (area_frac - 0.45) / 0.20)
 
     ih, iw = img_shape
     M = cv2.moments(cnt)
@@ -333,11 +340,13 @@ def _score_contour(cnt, img_area, img_shape):
     border_penalty = 0.05 if (touches_border and size_score < 0.65) else 0.0
 
     score = (
-        aspect_score    * 0.35
-        + rectangularity * 0.30
-        + size_score     * 0.15
+        aspect_score    * 0.30
+        + rectangularity * 0.25
+        + size_score     * 0.10
+        + center_score   * 0.10
         + solidity       * 0.05
         + (0.15 if has_four else 0.0)
+        - border_penalty
     )
 
     # Build the 4-point output
@@ -522,12 +531,52 @@ def detect_card(img):
                                                   open_sizes=(5, 9))):
         _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}", img_shape)
 
+    # ------------------------------------------------------------------
+    # Full-frame candidate — if the image aspect ratio matches a card,
+    # inject the image boundary as a moderate-score candidate.  In
+    # normal photos real card contours outscore it; in re-crops (where
+    # only internal features are detected) it wins as a tiebreaker.
+    # ------------------------------------------------------------------
+    frame_aspect = max(h, w) / max(1, min(h, w))
+    if ASPECT_LO <= frame_aspect <= ASPECT_HI:
+        frame_aspect_score = max(0.0, 1.0 - abs(frame_aspect - CARD_ASPECT) / 0.55)
+        # Moderate score: beats weak internal features, loses to real
+        # card contours in card-on-table photos.
+        frame_score = 0.35 + 0.20 * frame_aspect_score
+        m = 4
+        frame_quad = np.array([
+            [[m, m]], [[w - 1 - m, m]],
+            [[w - 1 - m, h - 1 - m]], [[m, h - 1 - m]]
+        ], dtype=np.int32)
+        candidates.append((frame_score, frame_quad, "full_frame"))
+
     if not candidates:
         return None, None
 
-    # Pick the highest-scoring candidate
+    # ------------------------------------------------------------------
+    # Candidate selection with area-reasonableness filter.
+    # Background-region detections (from inverse masks) can cover 50%+
+    # of the image and produce wildly wrong area.  If the top candidate
+    # is that large, prefer a high-scoring alternative with smaller area.
+    # ------------------------------------------------------------------
     candidates.sort(key=lambda x: x[0], reverse=True)
-    _, best_quad, strategy = candidates[0]
+    best_score, best_quad, strategy = candidates[0]
+
+    best_area_frac = cv2.contourArea(
+        best_quad.reshape(-1, 1, 2).astype(np.float32)
+    ) / img_area
+
+    if best_area_frac > 0.45 and strategy != "full_frame":
+        for sc, quad, strat in candidates[1:]:
+            if sc < best_score * 0.70:
+                break  # remaining candidates are too weak
+            qarea = cv2.contourArea(
+                quad.reshape(-1, 1, 2).astype(np.float32)
+            ) / img_area
+            if 0.02 <= qarea <= 0.45:
+                best_quad, strategy = quad, strat
+                break
+
     return best_quad, strategy
 
 
