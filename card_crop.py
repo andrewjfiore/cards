@@ -903,7 +903,7 @@ def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
 
     ocr_tag = "+ocr" if ocr_used else ""
     ml_tag = "+ml" if ml_scorer is not None else ""
-    return True, f"OK ({strategy}{ocr_tag}{ml_tag})", _format_ocr_inline(ocr_entries)
+    return True, f"OK ({strategy}{ocr_tag}{ml_tag})", _format_ocr_inline(full_ocr_entries)
 
 
 def _save_debug_overlay(img, contour, strategy, debug_dir, stem):
