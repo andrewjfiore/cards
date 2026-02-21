@@ -46,11 +46,11 @@ CARD_H_PX = 1050
 CARD_ASPECT = CARD_H_PX / CARD_W_PX  # 1.4
 
 # Acceptable aspect-ratio window for a card candidate
-ASPECT_LO = 1.15
-ASPECT_HI = 1.65
+ASPECT_LO = 1.05
+ASPECT_HI = 1.85
 
 # Contour area as a fraction of total image area
-AREA_MIN = 0.04
+AREA_MIN = 0.01
 AREA_MAX = 0.65
 
 # Maximum image dimension during detection (speed vs accuracy)
@@ -150,6 +150,10 @@ def _score_contour(cnt, img_area):
     approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
     has_four = (len(approx) == 4)
 
+    hull = cv2.convexHull(cnt)
+    hull_area = cv2.contourArea(hull)
+    solidity = area / hull_area if hull_area > 0 else 0
+
     # Aspect-ratio closeness to ideal 1.4
     aspect_score = max(0.0, 1.0 - abs(aspect - CARD_ASPECT) / 0.5)
 
@@ -159,7 +163,8 @@ def _score_contour(cnt, img_area):
     score = (
         aspect_score    * 0.35
         + rectangularity * 0.30
-        + size_score     * 0.20
+        + size_score     * 0.15
+        + solidity       * 0.05
         + (0.15 if has_four else 0.0)
     )
 
@@ -181,6 +186,27 @@ def _collect_candidates(contours, img_area):
         if sc > 0:
             results.append((sc, quad))
     return results
+
+
+def _add_mask_candidates(mask, img_area, candidates, strategy_name):
+    """Extract contour candidates from a binary mask and append scored quads."""
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for sc, quad in _collect_candidates(cnts, img_area):
+        candidates.append((sc, quad, strategy_name))
+
+
+def _morph_variants(mask, close_sizes=(11, 15, 21), open_sizes=(7, 11)):
+    """Yield morphology variants to bridge weak edges across lighting changes."""
+    variants = [mask]
+    for csz in close_sizes:
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (csz, csz))
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+        variants.append(closed)
+        for osz in open_sizes:
+            k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (osz, osz))
+            opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k_open)
+            variants.append(opened)
+    return variants
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +237,11 @@ def detect_card(img):
             closed, cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
         )
-        cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-        for sc, quad in _collect_candidates(cnts, img_area):
-            candidates.append((sc, quad, f"canny({lo},{hi})"))
+        _add_mask_candidates(closed, img_area, candidates, f"canny({lo},{hi})")
+
+        # Inverse canny mask can isolate lighter cards on darker woods
+        inv = cv2.bitwise_not(closed)
+        _add_mask_candidates(inv, img_area, candidates, f"canny_inv({lo},{hi})")
 
     # ------------------------------------------------------------------
     # Strategy 2 — Adaptive threshold
@@ -229,13 +256,18 @@ def detect_card(img):
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
                 bsz, C
             )
-            k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
-            cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-            for sc, quad in _collect_candidates(cnts, img_area):
-                candidates.append((sc, quad, f"adapt(b={bsz},C={C})"))
+            for idx, variant in enumerate(_morph_variants(binary)):
+                _add_mask_candidates(
+                    variant, img_area, candidates,
+                    f"adapt(b={bsz},C={C})#{idx}"
+                )
+
+            inv_binary = cv2.bitwise_not(binary)
+            for idx, variant in enumerate(_morph_variants(inv_binary)):
+                _add_mask_candidates(
+                    variant, img_area, candidates,
+                    f"adapt_inv(b={bsz},C={C})#{idx}"
+                )
 
     # ------------------------------------------------------------------
     # Strategy 3 — LAB L-channel + Otsu
@@ -247,13 +279,11 @@ def detect_card(img):
     l_blur = cv2.GaussianBlur(l_ch, (7, 7), 0)
     _, binary3 = cv2.threshold(l_blur, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    binary3 = cv2.morphologyEx(binary3, cv2.MORPH_CLOSE, k)
-    binary3 = cv2.morphologyEx(binary3, cv2.MORPH_OPEN, k)
-    cnts, _ = cv2.findContours(binary3, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
-    for sc, quad in _collect_candidates(cnts, img_area):
-        candidates.append((sc, quad, "lab+otsu"))
+    for idx, variant in enumerate(_morph_variants(binary3)):
+        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu#{idx}")
+    inv3 = cv2.bitwise_not(binary3)
+    for idx, variant in enumerate(_morph_variants(inv3)):
+        _add_mask_candidates(variant, img_area, candidates, f"lab+otsu_inv#{idx}")
 
     # ------------------------------------------------------------------
     # Strategy 4 — Simple grayscale Otsu (fallback)
@@ -261,13 +291,11 @@ def detect_card(img):
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     _, binary4 = cv2.threshold(blurred, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    binary4 = cv2.morphologyEx(binary4, cv2.MORPH_CLOSE, k)
-    binary4 = cv2.morphologyEx(binary4, cv2.MORPH_OPEN, k)
-    cnts, _ = cv2.findContours(binary4, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
-    for sc, quad in _collect_candidates(cnts, img_area):
-        candidates.append((sc, quad, "otsu"))
+    for idx, variant in enumerate(_morph_variants(binary4)):
+        _add_mask_candidates(variant, img_area, candidates, f"otsu#{idx}")
+    inv4 = cv2.bitwise_not(binary4)
+    for idx, variant in enumerate(_morph_variants(inv4)):
+        _add_mask_candidates(variant, img_area, candidates, f"otsu_inv#{idx}")
 
     # ------------------------------------------------------------------
     # Strategy 5 — HSV saturation + Otsu
@@ -280,13 +308,11 @@ def detect_card(img):
     s_blur = cv2.GaussianBlur(s_ch, (7, 7), 0)
     _, binary5 = cv2.threshold(s_blur, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    binary5 = cv2.morphologyEx(binary5, cv2.MORPH_CLOSE, k)
-    binary5 = cv2.morphologyEx(binary5, cv2.MORPH_OPEN, k)
-    cnts, _ = cv2.findContours(binary5, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
-    for sc, quad in _collect_candidates(cnts, img_area):
-        candidates.append((sc, quad, "hsv_sat"))
+    for idx, variant in enumerate(_morph_variants(binary5)):
+        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat#{idx}")
+    inv5 = cv2.bitwise_not(binary5)
+    for idx, variant in enumerate(_morph_variants(inv5)):
+        _add_mask_candidates(variant, img_area, candidates, f"hsv_sat_inv#{idx}")
 
     # ------------------------------------------------------------------
     # Strategy 6 — Median blur + Otsu
@@ -296,13 +322,26 @@ def detect_card(img):
     median = cv2.medianBlur(gray, 15)
     _, binary6 = cv2.threshold(median, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    binary6 = cv2.morphologyEx(binary6, cv2.MORPH_CLOSE, k)
-    binary6 = cv2.morphologyEx(binary6, cv2.MORPH_OPEN, k)
-    cnts, _ = cv2.findContours(binary6, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
-    for sc, quad in _collect_candidates(cnts, img_area):
-        candidates.append((sc, quad, "median+otsu"))
+    for idx, variant in enumerate(_morph_variants(binary6)):
+        _add_mask_candidates(variant, img_area, candidates, f"median+otsu#{idx}")
+    inv6 = cv2.bitwise_not(binary6)
+    for idx, variant in enumerate(_morph_variants(inv6)):
+        _add_mask_candidates(variant, img_area, candidates, f"median+otsu_inv#{idx}")
+
+    # ------------------------------------------------------------------
+    # Strategy 7 — Scharr gradient magnitude
+    # Captures strong border edges where thresholding fails due to gloss.
+    # ------------------------------------------------------------------
+    schx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    schy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(schx, schy)
+    mag_u8 = cv2.convertScaleAbs(mag)
+    mag_blur = cv2.GaussianBlur(mag_u8, (5, 5), 0)
+    _, binary7 = cv2.threshold(mag_blur, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for idx, variant in enumerate(_morph_variants(binary7, close_sizes=(9, 13, 17),
+                                                  open_sizes=(5, 9))):
+        _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}")
 
     if not candidates:
         return None, None
