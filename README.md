@@ -79,3 +79,19 @@ Interactive prompts cover:
 
 This mode is useful when you do not want to remember all CLI flags for each run.
 
+## ML semantic re-ranking (GPU-capable)
+
+You can optionally enable CLIP-based semantic scoring to bias detection toward card-like regions and away from wood-table false positives:
+
+```bash
+python card_crop.py --input-dir photos --output-dir output --ml-refine
+```
+
+Useful options:
+- `--ml-model` HuggingFace CLIP model id (default: `openai/clip-vit-base-patch32`)
+- `--ml-device` `auto|cpu|cuda`
+- `--ml-weight` blending weight for ML semantic score in final candidate ranking
+
+Notes:
+- This is optional and falls back to geometry/content heuristics if `torch`/`transformers`/model weights are unavailable.
+- When CUDA is available, CLIP inference runs on GPU.
