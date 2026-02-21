@@ -396,6 +396,53 @@ def _morph_variants(mask, close_sizes=(11, 15, 21), open_sizes=(7, 11)):
     return variants
 
 
+def _card_content_score(img, quad):
+    """
+    Score how card-like the warped quad content looks.
+
+    Geometric scoring can still select wood-table patches that happen to be
+    roughly rectangular and card-sized. This secondary score prefers regions
+    with printed-card characteristics: fine detail/edges plus some color
+    richness.
+    """
+    warped = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
+    if warped is None:
+        return 0.0
+
+    h, w = warped.shape[:2]
+    if h < 24 or w < 24:
+        return 0.0
+
+    # Normalize scale so texture metrics are comparable across candidates.
+    short_side = min(h, w)
+    scale = 220.0 / short_side
+    norm = cv2.resize(
+        warped,
+        (max(24, int(round(w * scale))), max(24, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    gray = cv2.cvtColor(norm, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(norm, cv2.COLOR_BGR2HSV)
+
+    # Fine printed text/art yields stronger local gradients than wood grain.
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+    lap_score = float(np.clip(np.log1p(lap_var) / 6.0, 0.0, 1.0))
+
+    # Edge density in a card is usually moderate to high because of text,
+    # player contours, logos, stat blocks, etc.
+    edges = cv2.Canny(gray, 70, 160)
+    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
+    edge_score = float(np.clip(edge_density / 0.11, 0.0, 1.0))
+
+    # Cards are often more saturated than wood, but keep this weight lower
+    # so low-saturation vintage cards are not rejected.
+    sat_mean = float(hsv[:, :, 1].mean()) / 255.0
+    sat_score = float(np.clip((sat_mean - 0.08) / 0.24, 0.0, 1.0))
+
+    return 0.45 * lap_score + 0.35 * edge_score + 0.20 * sat_score
+
+
 # ---------------------------------------------------------------------------
 # Multi-strategy card detection
 # ---------------------------------------------------------------------------
@@ -554,29 +601,28 @@ def detect_card(img):
         return None, None
 
     # ------------------------------------------------------------------
-    # Candidate selection with area-reasonableness filter.
-    # Background-region detections (from inverse masks) can cover 50%+
-    # of the image and produce wildly wrong area.  If the top candidate
-    # is that large, prefer a high-scoring alternative with smaller area.
+    # Candidate selection with geometry + content scoring.
+    # Geometry can still pick table rectangles; add a card-content score
+    # from the warped candidate and combine both signals.
     # ------------------------------------------------------------------
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_quad, strategy = candidates[0]
+    ranked = []
+    for geom_score, quad, strat in candidates:
+        area_frac = cv2.contourArea(
+            quad.reshape(-1, 1, 2).astype(np.float32)
+        ) / img_area
 
-    best_area_frac = cv2.contourArea(
-        best_quad.reshape(-1, 1, 2).astype(np.float32)
-    ) / img_area
+        content_score = _card_content_score(img, quad)
+        final_score = 0.68 * geom_score + 0.32 * content_score
 
-    if best_area_frac > 0.45 and strategy != "full_frame":
-        for sc, quad, strat in candidates[1:]:
-            if sc < best_score * 0.70:
-                break  # remaining candidates are too weak
-            qarea = cv2.contourArea(
-                quad.reshape(-1, 1, 2).astype(np.float32)
-            ) / img_area
-            if 0.02 <= qarea <= 0.45:
-                best_quad, strategy = quad, strat
-                break
+        # Large non-frame regions are often background leakage from inverse
+        # masks. Keep them available but with a clear penalty.
+        if area_frac > 0.45 and strat != "full_frame":
+            final_score -= 0.12
 
+        ranked.append((final_score, geom_score, content_score, quad, strat, area_frac))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    _, _, _, best_quad, strategy, _ = ranked[0]
     return best_quad, strategy
 
 
