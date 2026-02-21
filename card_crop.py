@@ -82,6 +82,11 @@ def parse_args():
     p.add_argument("--debug", action="store_true",
                    help="Save debug images showing detected contour")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--interactive", dest="interactive", action="store_true",
+                   help="Prompt for OCR/ML/GPU and debug options before processing (default: on in TTY)")
+    p.add_argument("--no-interactive", dest="interactive", action="store_false",
+                   help="Disable interactive prompts and run from flags only")
+    p.set_defaults(interactive=True)
     p.add_argument("--ocr-refine", action="store_true",
                    help="Use GPU-accelerated OCR (EasyOCR when available) to expand crop bounds so detected text is inside")
     p.add_argument("--ocr-min-conf", type=float, default=0.25,
@@ -103,6 +108,60 @@ def parse_args():
     p.add_argument("--ml-required", action="store_true",
                    help="Fail fast if --ml-refine is requested but CLIP could not be loaded")
     return p.parse_args()
+
+
+def _ask_yes_no(prompt, default=False):
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    while True:
+        raw = input(prompt + suffix).strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def _ask_float(prompt, default):
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print("Invalid number; using default.")
+        return default
+
+
+def apply_interactive_options(args):
+    """Interactive setup for common OCR/ML options."""
+    if not args.interactive:
+        return args
+
+    if not sys.stdin.isatty():
+        print("[WARN] --interactive requested but no TTY is available; skipping prompts")
+        return args
+
+    print("\n[SETUP] Interactive options")
+    print("Choose optional features for this run. Press Enter to accept defaults.\n")
+
+    args.ocr_refine = _ask_yes_no("Enable OCR crop expansion", default=args.ocr_refine)
+    if args.ocr_refine:
+        args.ocr_min_conf = _ask_float("OCR minimum confidence", args.ocr_min_conf)
+        args.ocr_text_margin = _ask_float("OCR text margin fraction", args.ocr_text_margin)
+
+    args.ml_refine = _ask_yes_no("Enable ML (CLIP) semantic reranking", default=args.ml_refine)
+    if args.ml_refine:
+        use_gpu = _ask_yes_no("Use GPU for ML if available", default=(args.ml_device in {"auto", "cuda"}))
+        args.ml_device = "cuda" if use_gpu else "cpu"
+        args.ml_weight = _ask_float("ML blend weight (0..1)", args.ml_weight)
+        args.ml_required = _ask_yes_no("Fail if ML cannot be enabled", default=args.ml_required)
+
+    args.debug = _ask_yes_no("Save debug overlays", default=args.debug)
+    args.ocr_csv = "ocr_results.csv" if _ask_yes_no("Write OCR CSV", default=bool(args.ocr_csv)) else ""
+    print()
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +953,7 @@ def collect_images(input_dir, extensions):
 
 def main():
     args = parse_args()
+    args = apply_interactive_options(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     extensions = [e.strip().lstrip(".") for e in args.ext.split(",")]
