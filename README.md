@@ -34,7 +34,7 @@ Options:
 - `--ocr-text-margin` extra border around OCR text boxes
 - `--ocr-csv ocr_results.csv` save per-file OCR text as inline string in CSV (`filename`, `ocr_text`)
 
-Implementation uses EasyOCR when installed and automatically enables GPU when `torch.cuda.is_available()` is true. If OCR dependencies are missing (or a card has no detectable text), cropping continues with geometric detection only.
+Implementation uses EasyOCR when installed and automatically enables GPU when `torch.cuda.is_available()` is true. OCR is run on the full source image before crop/warp so refinement has all available text context. If OCR dependencies are missing (or a card has no detectable text), cropping continues with geometric detection only.
 
 ## ML semantic re-ranking (GPU-capable)
 

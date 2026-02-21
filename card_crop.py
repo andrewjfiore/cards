@@ -100,6 +100,8 @@ def parse_args():
                    help="Device for ML scorer (default: auto)")
     p.add_argument("--ml-weight", type=float, default=0.40,
                    help="Blend weight [0..1] for CLIP semantic score in final ranking")
+    p.add_argument("--ml-required", action="store_true",
+                   help="Fail fast if --ml-refine is requested but CLIP could not be loaded")
     return p.parse_args()
 
 
@@ -211,9 +213,10 @@ def _format_ocr_inline(entries):
     return " | ".join(chunks)
 
 
-def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_frac=0.03):
+def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_frac=0.03, entries=None):
     """Expand card quad so OCR-detected text near the card remains inside bounds."""
-    entries = _detect_text_entries(img, min_conf=min_conf, max_dim=max_dim)
+    if entries is None:
+        entries = _detect_text_entries(img, min_conf=min_conf, max_dim=max_dim)
     boxes = [e["box"] for e in entries]
     if not boxes:
         return quad, False
@@ -275,6 +278,7 @@ def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_fr
 # ML semantic scorer (CLIP; GPU-capable)
 # ---------------------------------------------------------------------------
 _CLIP_SCORER_CACHE = {}
+_CLIP_SCORER_STATUS = {}
 
 
 def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"):
@@ -300,12 +304,18 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
     try:
         processor = CLIPProcessor.from_pretrained(model_id)
         model = CLIPModel.from_pretrained(model_id)
-    except Exception:
+    except Exception as e:
+        status["reason"] = f"Could not load model '{model_id}': {e}"
         _CLIP_SCORER_CACHE[key] = None
-        return None
+        _CLIP_SCORER_STATUS[key] = status
+        return None, status
 
     model.eval()
     model.to(dev)
+    status["enabled"] = True
+    status["runtime_device"] = dev
+    if not status["reason"]:
+        status["reason"] = "loaded"
 
     prompts = [
         "a close-up photo of a baseball trading card",
@@ -339,7 +349,8 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
             return float(1.0 / (1.0 + np.exp(-6.0 * margin)))
 
     _CLIP_SCORER_CACHE[key] = _score_patch
-    return _score_patch
+    _CLIP_SCORER_STATUS[key] = status
+    return _score_patch, status
 
 
 # ---------------------------------------------------------------------------
@@ -686,23 +697,40 @@ def detect_card(img, ml_scorer=None, ml_weight=0.40):
     # from the warped candidate and combine both signals.
     # ------------------------------------------------------------------
     ranked = []
-    for geom_score, quad, strat in candidates:
+    ml_weight = float(np.clip(ml_weight, 0.0, 1.0)) if ml_scorer is not None else 0.0
+
+    # Limit expensive ML scoring to strongest geometric candidates.
+    geom_sorted = sorted(candidates, key=lambda x: x[0], reverse=True)
+    ml_limit = min(32, len(geom_sorted))
+
+    for idx, (geom_score, quad, strat) in enumerate(geom_sorted):
         area_frac = cv2.contourArea(
             quad.reshape(-1, 1, 2).astype(np.float32)
         ) / img_area
 
         content_score = _card_content_score(img, quad)
-        final_score = 0.68 * geom_score + 0.32 * content_score
+        base_score = 0.72 * geom_score + 0.28 * content_score
+
+        ml_score = base_score
+        if ml_scorer is not None and idx < ml_limit:
+            patch = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
+            if patch is not None and min(patch.shape[:2]) >= 24:
+                try:
+                    ml_score = ml_scorer(patch)
+                except Exception:
+                    ml_score = base_score
+
+        final_score = (1.0 - ml_weight) * base_score + ml_weight * ml_score
 
         # Large non-frame regions are often background leakage from inverse
         # masks. Keep them available but with a clear penalty.
         if area_frac > 0.45 and strat != "full_frame":
             final_score -= 0.12
 
-        ranked.append((final_score, geom_score, content_score, quad, strat, area_frac))
+        ranked.append((final_score, geom_score, content_score, ml_score, quad, strat, area_frac))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
-    _, _, _, best_quad, strategy, _ = ranked[0]
+    _, _, _, _, best_quad, strategy, _ = ranked[0]
     return best_quad, strategy
 
 
@@ -744,6 +772,16 @@ def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
 
     oh, ow = img.shape[:2]
 
+    # OCR pass on the full image before any crop/warp so refinement and CSV
+    # can use all available text context.
+    full_ocr_entries = []
+    if args.ocr_refine or args.ocr_csv:
+        full_ocr_entries = _detect_text_entries(
+            img,
+            min_conf=args.ocr_min_conf,
+            max_dim=args.ocr_max_dim,
+        )
+
     # Downscale for faster detection on large phone photos
     if max(oh, ow) > DETECT_MAX_DIM:
         scale = DETECT_MAX_DIM / max(oh, ow)
@@ -773,6 +811,7 @@ def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
             min_conf=args.ocr_min_conf,
             max_dim=args.ocr_max_dim,
             text_margin_frac=args.ocr_text_margin,
+            entries=full_ocr_entries,
         )
 
     # Perspective warp on full-resolution image
@@ -800,14 +839,6 @@ def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
     # Debug overlay — draw detected contour on the original image
     if debug_dir:
         _save_debug_overlay(img, contour, strategy, debug_dir, src.stem)
-
-    ocr_entries = []
-    if args.ocr_refine or args.ocr_csv:
-        ocr_entries = _detect_text_entries(
-            warped,
-            min_conf=args.ocr_min_conf,
-            max_dim=args.ocr_max_dim,
-        )
 
     ocr_tag = "+ocr" if ocr_used else ""
     ml_tag = "+ml" if ml_scorer is not None else ""
