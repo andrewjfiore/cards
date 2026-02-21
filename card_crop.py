@@ -353,6 +353,8 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
     import torch
     from transformers import CLIPModel, CLIPProcessor
 
+    status = {"enabled": False, "reason": ""}
+
     if device == "auto":
         dev = "cuda" if torch.cuda.is_available() else "cpu"
     else:
@@ -367,7 +369,7 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
         status["reason"] = f"Could not load model '{model_id}': {e}"
         _CLIP_SCORER_CACHE[key] = None
         _CLIP_SCORER_STATUS[key] = status
-        return None, status
+        return None
 
     model.eval()
     model.to(dev)
@@ -409,7 +411,7 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
 
     _CLIP_SCORER_CACHE[key] = _score_patch
     _CLIP_SCORER_STATUS[key] = status
-    return _score_patch, status
+    return _score_patch
 
 
 # ---------------------------------------------------------------------------
