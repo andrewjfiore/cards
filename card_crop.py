@@ -353,6 +353,12 @@ def _score_contour(cnt, img_area, img_shape):
 def _collect_candidates(contours, img_area, img_shape):
     """Score contours and return list of (score, quad)."""
     results = []
+    if img_shape is None and contours:
+        x, y, w, h = cv2.boundingRect(np.vstack(contours))
+        img_shape = (max(1, y + h), max(1, x + w))
+    elif img_shape is None:
+        img_shape = (1, 1)
+
     for cnt in contours:
         sc, quad = _score_contour(cnt, img_area, img_shape)
         if sc > 0:
