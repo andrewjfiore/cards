@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import csv
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -91,6 +92,14 @@ def parse_args():
                    help="Extra margin around OCR text boxes as fraction of card short side")
     p.add_argument("--ocr-csv", default="",
                    help="Optional CSV path to save OCR text per output file (filename + inline text string)")
+    p.add_argument("--ml-refine", action="store_true",
+                   help="Use CLIP image-text recognition (GPU when available) to improve candidate ranking")
+    p.add_argument("--ml-model", default="openai/clip-vit-base-patch32",
+                   help="HuggingFace CLIP model id used for semantic card scoring")
+    p.add_argument("--ml-device", default="auto", choices=["auto", "cpu", "cuda"],
+                   help="Device for ML scorer (default: auto)")
+    p.add_argument("--ml-weight", type=float, default=0.40,
+                   help="Blend weight [0..1] for CLIP semantic score in final ranking")
     return p.parse_args()
 
 
@@ -263,6 +272,77 @@ def _refine_quad_with_ocr(img, quad, min_conf=0.25, max_dim=1800, text_margin_fr
 
 
 # ---------------------------------------------------------------------------
+# ML semantic scorer (CLIP; GPU-capable)
+# ---------------------------------------------------------------------------
+_CLIP_SCORER_CACHE = {}
+
+
+def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"):
+    """Return a callable that scores how likely an image patch is a baseball card."""
+    key = (model_id, device)
+    if key in _CLIP_SCORER_CACHE:
+        return _CLIP_SCORER_CACHE[key]
+
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None:
+        _CLIP_SCORER_CACHE[key] = None
+        return None
+
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
+    if device == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        dev = device
+    if dev == "cuda" and not torch.cuda.is_available():
+        dev = "cpu"
+
+    try:
+        processor = CLIPProcessor.from_pretrained(model_id)
+        model = CLIPModel.from_pretrained(model_id)
+    except Exception:
+        _CLIP_SCORER_CACHE[key] = None
+        return None
+
+    model.eval()
+    model.to(dev)
+
+    prompts = [
+        "a close-up photo of a baseball trading card",
+        "a sports card on a table",
+        "a printed baseball card with text and player image",
+        "a wooden tabletop texture",
+        "a plain wooden surface",
+        "wood grain background",
+    ]
+
+    with torch.no_grad():
+        text_inputs = processor(text=prompts, return_tensors="pt", padding=True).to(dev)
+        text_feats = model.get_text_features(**text_inputs)
+        text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
+
+    pos_idx = [0, 1, 2]
+    neg_idx = [3, 4, 5]
+
+    def _score_patch(bgr_img):
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        with torch.no_grad():
+            img_inputs = processor(images=pil, return_tensors="pt").to(dev)
+            img_feats = model.get_image_features(**img_inputs)
+            img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
+
+            sims = (img_feats @ text_feats.T).squeeze(0)
+            pos = float(sims[pos_idx].mean().item())
+            neg = float(sims[neg_idx].mean().item())
+            margin = pos - neg
+            return float(1.0 / (1.0 + np.exp(-6.0 * margin)))
+
+    _CLIP_SCORER_CACHE[key] = _score_patch
+    return _score_patch
+
+
+# ---------------------------------------------------------------------------
 # Contour scoring
 # ---------------------------------------------------------------------------
 def _score_contour(cnt, img_area, img_shape):
@@ -396,10 +476,57 @@ def _morph_variants(mask, close_sizes=(11, 15, 21), open_sizes=(7, 11)):
     return variants
 
 
+def _card_content_score(img, quad):
+    """
+    Score how card-like the warped quad content looks.
+
+    Geometric scoring can still select wood-table patches that happen to be
+    roughly rectangular and card-sized. This secondary score prefers regions
+    with printed-card characteristics: fine detail/edges plus some color
+    richness.
+    """
+    warped = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
+    if warped is None:
+        return 0.0
+
+    h, w = warped.shape[:2]
+    if h < 24 or w < 24:
+        return 0.0
+
+    # Normalize scale so texture metrics are comparable across candidates.
+    short_side = min(h, w)
+    scale = 220.0 / short_side
+    norm = cv2.resize(
+        warped,
+        (max(24, int(round(w * scale))), max(24, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    gray = cv2.cvtColor(norm, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(norm, cv2.COLOR_BGR2HSV)
+
+    # Fine printed text/art yields stronger local gradients than wood grain.
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+    lap_score = float(np.clip(np.log1p(lap_var) / 6.0, 0.0, 1.0))
+
+    # Edge density in a card is usually moderate to high because of text,
+    # player contours, logos, stat blocks, etc.
+    edges = cv2.Canny(gray, 70, 160)
+    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
+    edge_score = float(np.clip(edge_density / 0.11, 0.0, 1.0))
+
+    # Cards are often more saturated than wood, but keep this weight lower
+    # so low-saturation vintage cards are not rejected.
+    sat_mean = float(hsv[:, :, 1].mean()) / 255.0
+    sat_score = float(np.clip((sat_mean - 0.08) / 0.24, 0.0, 1.0))
+
+    return 0.45 * lap_score + 0.35 * edge_score + 0.20 * sat_score
+
+
 # ---------------------------------------------------------------------------
 # Multi-strategy card detection
 # ---------------------------------------------------------------------------
-def detect_card(img):
+def detect_card(img, ml_scorer=None, ml_weight=0.40):
     """
     Try multiple detection strategies to find the card in a phone photo.
     Returns (4-point contour, strategy_name) or (None, None).
@@ -554,29 +681,45 @@ def detect_card(img):
         return None, None
 
     # ------------------------------------------------------------------
-    # Candidate selection with area-reasonableness filter.
-    # Background-region detections (from inverse masks) can cover 50%+
-    # of the image and produce wildly wrong area.  If the top candidate
-    # is that large, prefer a high-scoring alternative with smaller area.
+    # Candidate selection with geometry + content scoring.
+    # Geometry can still pick table rectangles; add a card-content score
+    # from the warped candidate and combine both signals.
     # ------------------------------------------------------------------
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_quad, strategy = candidates[0]
+    ranked = []
+    ml_weight = float(np.clip(ml_weight, 0.0, 1.0)) if ml_scorer is not None else 0.0
 
-    best_area_frac = cv2.contourArea(
-        best_quad.reshape(-1, 1, 2).astype(np.float32)
-    ) / img_area
+    # Limit expensive ML scoring to strongest geometric candidates.
+    geom_sorted = sorted(candidates, key=lambda x: x[0], reverse=True)
+    ml_limit = min(32, len(geom_sorted))
 
-    if best_area_frac > 0.45 and strategy != "full_frame":
-        for sc, quad, strat in candidates[1:]:
-            if sc < best_score * 0.70:
-                break  # remaining candidates are too weak
-            qarea = cv2.contourArea(
-                quad.reshape(-1, 1, 2).astype(np.float32)
-            ) / img_area
-            if 0.02 <= qarea <= 0.45:
-                best_quad, strategy = quad, strat
-                break
+    for idx, (geom_score, quad, strat) in enumerate(geom_sorted):
+        area_frac = cv2.contourArea(
+            quad.reshape(-1, 1, 2).astype(np.float32)
+        ) / img_area
 
+        content_score = _card_content_score(img, quad)
+        base_score = 0.72 * geom_score + 0.28 * content_score
+
+        ml_score = base_score
+        if ml_scorer is not None and idx < ml_limit:
+            patch = four_point_transform(img, quad.reshape(4, 2).astype(np.float32))
+            if patch is not None and min(patch.shape[:2]) >= 24:
+                try:
+                    ml_score = ml_scorer(patch)
+                except Exception:
+                    ml_score = base_score
+
+        final_score = (1.0 - ml_weight) * base_score + ml_weight * ml_score
+
+        # Large non-frame regions are often background leakage from inverse
+        # masks. Keep them available but with a clear penalty.
+        if area_frac > 0.45 and strat != "full_frame":
+            final_score -= 0.12
+
+        ranked.append((final_score, geom_score, content_score, ml_score, quad, strat, area_frac))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    _, _, _, _, best_quad, strategy, _ = ranked[0]
     return best_quad, strategy
 
 
@@ -610,7 +753,7 @@ def fix_upside_down(img):
 # ---------------------------------------------------------------------------
 # Image processing pipeline
 # ---------------------------------------------------------------------------
-def process_image(src, dst, args, debug_dir=None):
+def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
     """Process a single image: detect card, warp, orient, resize, save."""
     img = cv2.imread(str(src))
     if img is None:
@@ -627,7 +770,7 @@ def process_image(src, dst, args, debug_dir=None):
         small = img
         scale = 1.0
 
-    contour, strategy = detect_card(small)
+    contour, strategy = detect_card(small, ml_scorer=ml_scorer, ml_weight=args.ml_weight)
     if contour is None:
         # Save failed debug image if requested
         if debug_dir:
@@ -684,7 +827,8 @@ def process_image(src, dst, args, debug_dir=None):
         )
 
     ocr_tag = "+ocr" if ocr_used else ""
-    return True, f"OK ({strategy}{ocr_tag})", _format_ocr_inline(ocr_entries)
+    ml_tag = "+ml" if ml_scorer is not None else ""
+    return True, f"OK ({strategy}{ocr_tag}{ml_tag})", _format_ocr_inline(ocr_entries)
 
 
 def _save_debug_overlay(img, contour, strategy, debug_dir, stem):
@@ -763,7 +907,17 @@ def main():
     print(f"[INFO] Padding: {args.padding}px")
     if args.debug:
         print(f"[INFO] Debug  : ON")
+    if args.ml_refine:
+        print(f"[INFO] ML     : requested (weight={args.ml_weight:.2f})")
     print()
+
+    ml_scorer = None
+    if args.ml_refine:
+        ml_scorer = _get_clip_card_scorer(args.ml_model, args.ml_device)
+        if ml_scorer is None:
+            print("[WARN] ML refine requested but CLIP dependencies/model are unavailable; continuing without ML")
+        else:
+            print(f"[INFO] ML scorer: ON ({args.ml_model} on {args.ml_device})")
 
     ok = fail = 0
     ocr_rows = []
@@ -777,7 +931,7 @@ def main():
             print("[DRY RUN]")
             continue
 
-        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir)
+        success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir, ml_scorer=ml_scorer)
         if success:
             ok += 1
             print(f"[OK] {msg}")
