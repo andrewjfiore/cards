@@ -87,8 +87,10 @@ def parse_args():
     p.add_argument("--no-interactive", dest="interactive", action="store_false",
                    help="Disable interactive prompts and run from flags only")
     p.set_defaults(interactive=True)
-    p.add_argument("--ocr-refine", action="store_true",
-                   help="Use GPU-accelerated OCR (EasyOCR when available) to expand crop bounds so detected text is inside")
+    p.add_argument("--ocr-refine", action="store_true", dest="ocr_refine", default=True,
+                   help="Use GPU-accelerated OCR (EasyOCR when available) to expand crop bounds so detected text is inside (default: on)")
+    p.add_argument("--no-ocr-refine", action="store_false", dest="ocr_refine",
+                   help="Disable OCR crop expansion")
     p.add_argument("--ocr-min-conf", type=float, default=0.25,
                    help="Minimum OCR confidence for text boxes used in crop refinement")
     p.add_argument("--ocr-max-dim", type=int, default=1800,
@@ -97,8 +99,10 @@ def parse_args():
                    help="Extra margin around OCR text boxes as fraction of card short side")
     p.add_argument("--ocr-csv", default="",
                    help="Optional CSV path to save OCR text per output file (filename + inline text string)")
-    p.add_argument("--ml-refine", action="store_true",
-                   help="Use CLIP image-text recognition (GPU when available) to improve candidate ranking")
+    p.add_argument("--ml-refine", action="store_true", dest="ml_refine", default=True,
+                   help="Use CLIP image-text recognition (GPU when available) to improve candidate ranking (default: on)")
+    p.add_argument("--no-ml-refine", action="store_false", dest="ml_refine",
+                   help="Disable ML (CLIP) semantic reranking")
     p.add_argument("--ml-model", default="openai/clip-vit-base-patch32",
                    help="HuggingFace CLIP model id used for semantic card scoring")
     p.add_argument("--ml-device", default="auto", choices=["auto", "cpu", "cuda"],
