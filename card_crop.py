@@ -487,17 +487,40 @@ def _load_detector(detector_type, model_id="", device="auto"):
         _DETECTOR_MODEL_CACHE[key] = None
         return None
 
-    try:
-        if detector_type == "rtdetr":
-            model = RTDETR(model_id)
-        else:
-            model = YOLO(model_id)
-        _DETECTOR_MODEL_CACHE[key] = model
-        return model
-    except Exception as e:
-        print(f"[WARN] Could not load {detector_type} model '{model_id}': {e}")
-        _DETECTOR_MODEL_CACHE[key] = None
-        return None
+    # Try loading; if it fails with a corrupted archive, delete and retry once.
+    for attempt in range(2):
+        try:
+            if detector_type == "rtdetr":
+                model = RTDETR(model_id)
+            else:
+                model = YOLO(model_id)
+            _DETECTOR_MODEL_CACHE[key] = model
+            return model
+        except Exception as e:
+            err = str(e)
+            is_corrupt = ("zip archive" in err or "PytorchStreamReader" in err
+                          or "unexpected EOF" in err.lower())
+            if is_corrupt and attempt == 0:
+                # Delete the corrupted file so ultralytics re-downloads it.
+                local = Path(model_id)
+                if local.exists() and local.is_file():
+                    print(f"[WARN] Corrupted model file '{model_id}'; deleting for re-download ...")
+                    local.unlink()
+                    continue
+                # Also check ultralytics default cache locations.
+                import ultralytics
+                cache_dir = Path(ultralytics.settings.get("weights_dir", ""))
+                cached = cache_dir / model_id if cache_dir.is_dir() else None
+                if cached and cached.exists():
+                    print(f"[WARN] Corrupted cached model '{cached}'; deleting for re-download ...")
+                    cached.unlink()
+                    continue
+            print(f"[WARN] Could not load {detector_type} model '{model_id}': {e}")
+            _DETECTOR_MODEL_CACHE[key] = None
+            return None
+
+    _DETECTOR_MODEL_CACHE[key] = None
+    return None
 
 
 def _detect_card_object(img, detector_type="rtdetr", model_id="",
