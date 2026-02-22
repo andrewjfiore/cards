@@ -5,21 +5,24 @@ configuration through multi-armed bandit experimentation.
 
 ## Quick Start
 
-```bash
+```powershell
 # 1. From the repo root, install the main card_crop dependencies (if not already)
 pip install -r requirements.txt
 
-# 2. Install the tuner's own dependencies
+# 2. Install the tuner's own dependencies (still from repo root)
 pip install -r tuner/requirements.txt
 
-# 3. Start the server
+# 3. Move into the tuner directory and start the server
 cd tuner
 python server.py
-# → listening on http://0.0.0.0:8377
 
 # 4. Open in your browser
 #    http://localhost:8377
 ```
+
+> **Windows note:** Use `cd tuner` then `python server.py` as separate
+> commands (PowerShell doesn't support `&&` in older versions).
+> Browse to `http://localhost:8377` — not `0.0.0.0`.
 
 ## How It Works
 
