@@ -9,19 +9,17 @@ Optimized for:
   * Card occupies roughly 25-40% of the frame
 
 Detection strategy:
-  The wood grain background makes simple thresholding unreliable, so we
-  use multiple complementary strategies and score the results:
-    1. Bilateral filter + Canny edges (smooths grain, preserves card edges)
-    2. Adaptive thresholding (handles uneven lighting)
-    3. LAB L-channel + Otsu (perceptual lightness separates card from wood)
-    4. Grayscale Otsu (simple fallback)
-    5. HSV saturation + Otsu (dark-bordered cards are colorful vs brown wood)
-    6. Median blur + Otsu (median filter kills periodic wood grain patterns)
-    7. Scharr gradient magnitude (strong card-border edges)
-    8. LAB distance-from-wood background model (table-color rejection)
-    9. GrabCut foreground proposals (document-scanner style fallback)
-  Each candidate contour is scored on rectangularity, aspect ratio,
-  area, center proximity, and circularity (to reject the round pan).
+  1. (Primary) RT-DETR / YOLO object detection via ultralytics — directly
+     detects cards, books, and rectangular objects with bounding boxes.
+     Fastest and most accurate when the model is available.
+  2. (Fallback) Multi-strategy contour detection with 9 complementary CV
+     pipelines scored on rectangularity, aspect ratio, area, center
+     proximity, and circularity.  Used when the detector is unavailable
+     or finds nothing.
+  3. CLIP semantic reranking — optional secondary scorer that boosts
+     candidates that visually resemble baseball cards.
+  4. OCR crop expansion — EasyOCR detects text near card edges and expands
+     the crop to include it.
 
 Requires:  pip install -r requirements.txt
            (or just double-click run_card_crop.bat — it sets up a venv automatically)
@@ -112,6 +110,13 @@ def parse_args():
                    help="Blend weight [0..1] for CLIP semantic score in final ranking")
     p.add_argument("--ml-required", action="store_true",
                    help="Fail fast if --ml-refine is requested but CLIP could not be loaded")
+    p.add_argument("--detector", default="auto",
+                   choices=["auto", "rtdetr", "yolo", "contour"],
+                   help="Primary detection method (default: auto — tries RT-DETR, then YOLO, then contour)")
+    p.add_argument("--detector-model", default="",
+                   help="Ultralytics model id (e.g. rtdetr-x, yolo12x). Empty = sensible default per --detector")
+    p.add_argument("--detector-conf", type=float, default=0.35,
+                   help="Minimum confidence for object detector (default: 0.35)")
     return p.parse_args()
 
 
@@ -139,6 +144,17 @@ def _ask_float(prompt, default):
         return default
 
 
+def _ask_choice(prompt, choices, default):
+    """Ask user to pick from a list of choices."""
+    raw = input(f"{prompt} [{default}]: ").strip().lower()
+    if not raw:
+        return default
+    if raw in choices:
+        return raw
+    print(f"Invalid choice; using default '{default}'.")
+    return default
+
+
 def apply_interactive_options(args):
     """Interactive setup for common OCR/ML options."""
     if not args.interactive:
@@ -150,6 +166,12 @@ def apply_interactive_options(args):
 
     print("\n[SETUP] Interactive options")
     print("Choose optional features for this run. Press Enter to accept defaults.\n")
+
+    args.detector = _ask_choice(
+        "Detection method (auto/rtdetr/yolo/contour)",
+        ["auto", "rtdetr", "yolo", "contour"],
+        args.detector,
+    )
 
     args.ocr_refine = _ask_yes_no("Enable OCR crop expansion", default=args.ocr_refine)
     if args.ocr_refine:
@@ -432,6 +454,147 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
     _CLIP_SCORER_CACHE[key] = _score_patch
     _CLIP_SCORER_STATUS[key] = status
     return _score_patch
+
+
+# ---------------------------------------------------------------------------
+# Object detection via ultralytics (RT-DETR / YOLO)
+# ---------------------------------------------------------------------------
+_DETECTOR_MODEL_CACHE = {}
+
+# COCO class names likely to correspond to a card on a table.
+# "book" is the closest COCO category to a trading card.
+_CARD_CLASSES = {"book", "cell phone", "remote", "laptop"}
+
+# Default model ids per detector type.
+_DEFAULT_MODELS = {
+    "rtdetr": "rtdetr-x.pt",
+    "yolo": "yolo11x.pt",
+}
+
+
+def _load_detector(detector_type, model_id="", device="auto"):
+    """Load an ultralytics model (RT-DETR or YOLO). Returns model or None."""
+    if not model_id:
+        model_id = _DEFAULT_MODELS.get(detector_type, "rtdetr-x.pt")
+
+    key = (detector_type, model_id)
+    if key in _DETECTOR_MODEL_CACHE:
+        return _DETECTOR_MODEL_CACHE[key]
+
+    try:
+        from ultralytics import RTDETR, YOLO
+    except ImportError:
+        _DETECTOR_MODEL_CACHE[key] = None
+        return None
+
+    try:
+        if detector_type == "rtdetr":
+            model = RTDETR(model_id)
+        else:
+            model = YOLO(model_id)
+        _DETECTOR_MODEL_CACHE[key] = model
+        return model
+    except Exception as e:
+        print(f"[WARN] Could not load {detector_type} model '{model_id}': {e}")
+        _DETECTOR_MODEL_CACHE[key] = None
+        return None
+
+
+def _detect_card_object(img, detector_type="rtdetr", model_id="",
+                        conf=0.35, device="auto"):
+    """
+    Run an ultralytics object detector on *img* (BGR numpy array).
+
+    Returns (4-point quad, strategy_name) or (None, None).
+    The best detection is chosen by: highest confidence, then largest area.
+    We accept COCO classes that plausibly match a card, plus any detection
+    whose aspect ratio looks card-like.
+    """
+    model = _load_detector(detector_type, model_id, device)
+    if model is None:
+        return None, None
+
+    h, w = img.shape[:2]
+
+    try:
+        results = model.predict(img, conf=conf, verbose=False, device=device)
+    except Exception:
+        # Fall back to CPU on device errors (e.g. no CUDA)
+        try:
+            results = model.predict(img, conf=conf, verbose=False, device="cpu")
+        except Exception:
+            return None, None
+
+    if not results or len(results[0].boxes) == 0:
+        return None, None
+
+    boxes = results[0].boxes
+    names = results[0].names  # {id: class_name}
+
+    best = None  # (confidence, area, x1, y1, x2, y2, label)
+
+    for i in range(len(boxes)):
+        x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().astype(int)
+        confidence = float(boxes.conf[i].cpu().numpy())
+        cls_id = int(boxes.cls[i].cpu().numpy())
+        label = names.get(cls_id, "").lower()
+
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 20 or bh < 20:
+            continue
+
+        # Accept known card-like classes, OR any box with card-like aspect ratio.
+        aspect = max(bw, bh) / max(1, min(bw, bh))
+        is_card_class = label in _CARD_CLASSES
+        is_card_aspect = ASPECT_LO <= aspect <= ASPECT_HI
+
+        if not is_card_class and not is_card_aspect:
+            continue
+
+        area = bw * bh
+        if best is None or confidence > best[0] or (confidence == best[0] and area > best[1]):
+            best = (confidence, area, x1, y1, x2, y2, label)
+
+    if best is None:
+        return None, None
+
+    conf, _, x1, y1, x2, y2, best_label = best
+    quad = np.array([
+        [[x1, y1]], [[x2, y1]], [[x2, y2]], [[x1, y2]]
+    ], dtype=np.int32)
+
+    strategy = f"{detector_type}({best_label}@{conf:.2f})"
+    return quad, strategy
+
+
+def _try_object_detectors(img, args):
+    """
+    Attempt object detection with the requested detector(s).
+
+    With --detector auto, tries RT-DETR first, then YOLO, then gives up
+    (caller falls back to contour pipeline).  Returns (quad, strategy) or
+    (None, None).
+    """
+    order = []
+    if args.detector == "auto":
+        order = ["rtdetr", "yolo"]
+    elif args.detector in ("rtdetr", "yolo"):
+        order = [args.detector]
+    else:
+        return None, None  # "contour" — skip ML detectors
+
+    for det in order:
+        quad, strat = _detect_card_object(
+            img,
+            detector_type=det,
+            model_id=args.detector_model,
+            conf=args.detector_conf,
+            device=args.ml_device,
+        )
+        if quad is not None:
+            return quad, strat
+
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -863,26 +1026,30 @@ def process_image(src, dst, args, debug_dir=None, ml_scorer=None):
             max_dim=args.ocr_max_dim,
         )
 
-    # Downscale for faster detection on large phone photos
-    if max(oh, ow) > DETECT_MAX_DIM:
-        scale = DETECT_MAX_DIM / max(oh, ow)
-        small = cv2.resize(img, (int(ow * scale), int(oh * scale)),
-                           interpolation=cv2.INTER_AREA)
-    else:
-        small = img
-        scale = 1.0
+    # --- Primary: try object detector (RT-DETR / YOLO) on full image ---
+    contour, strategy = _try_object_detectors(img, args)
 
-    contour, strategy = detect_card(small, ml_scorer=ml_scorer, ml_weight=args.ml_weight)
+    # --- Fallback: multi-strategy contour detection on downscaled image ---
     if contour is None:
-        # Save failed debug image if requested
+        if max(oh, ow) > DETECT_MAX_DIM:
+            scale = DETECT_MAX_DIM / max(oh, ow)
+            small = cv2.resize(img, (int(ow * scale), int(oh * scale)),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small = img
+            scale = 1.0
+
+        contour, strategy = detect_card(small, ml_scorer=ml_scorer, ml_weight=args.ml_weight)
+
+        # Scale contour back to original resolution
+        if contour is not None and scale != 1.0:
+            contour = (contour.astype(np.float64) / scale).astype(np.float32)
+
+    if contour is None:
         if debug_dir:
             debug_path = debug_dir / f"FAIL_{src.stem}.jpg"
             _save_debug_fail(img, debug_path)
         return False, "No card detected", ""
-
-    # Scale contour back to original resolution
-    if scale != 1.0:
-        contour = (contour.astype(np.float64) / scale).astype(np.float32)
 
     ocr_used = False
     if args.ocr_refine:
@@ -997,14 +1164,15 @@ def main():
         debug_dir = output_dir / "debug"
         debug_dir.mkdir(exist_ok=True)
 
-    print(f"[INFO] Input  : {input_dir}")
-    print(f"[INFO] Output : {output_dir}")
-    print(f"[INFO] Images : {len(images)}")
-    print(f"[INFO] Padding: {args.padding}px")
+    print(f"[INFO] Input   : {input_dir}")
+    print(f"[INFO] Output  : {output_dir}")
+    print(f"[INFO] Images  : {len(images)}")
+    print(f"[INFO] Padding : {args.padding}px")
+    print(f"[INFO] Detector: {args.detector}")
     if args.debug:
-        print(f"[INFO] Debug  : ON")
+        print(f"[INFO] Debug   : ON")
     if args.ml_refine:
-        print(f"[INFO] ML     : requested (weight={args.ml_weight:.2f})")
+        print(f"[INFO] ML      : requested (weight={args.ml_weight:.2f})")
     print()
 
     ml_scorer = None
