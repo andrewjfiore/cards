@@ -11,3 +11,6 @@ torch>=2.6
 torchvision>=0.21
 transformers>=4.40
 safetensors>=0.4
+
+# Object detection (RT-DETR / YOLO)
+ultralytics>=8.3
