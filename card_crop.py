@@ -76,8 +76,8 @@ def parse_args():
     p.add_argument("--ext",
                    default="jpg,jpeg,png,tiff,bmp,JPG,JPEG,PNG,TIFF,BMP",
                    help="Comma-separated file extensions to process")
-    p.add_argument("--padding", default=10, type=int,
-                   help="White border in px added after crop (default: 10)")
+    p.add_argument("--padding", default=0, type=int,
+                   help="White border in px added after crop (default: 0)")
     p.add_argument("--no-resize", action="store_true",
                    help="Skip resize to standard card dimensions")
     p.add_argument("--debug", action="store_true",
@@ -392,9 +392,24 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
         "wood grain background",
     ]
 
+    def _to_tensor(feat):
+        """Extract a plain tensor from get_text_features / get_image_features.
+
+        Newer transformers versions may return a dataclass instead of a
+        raw tensor; handle both cases.
+        """
+        if isinstance(feat, torch.Tensor):
+            return feat
+        # BaseModelOutputWithPooling or similar
+        if hasattr(feat, "pooler_output") and feat.pooler_output is not None:
+            return feat.pooler_output
+        if hasattr(feat, "last_hidden_state"):
+            return feat.last_hidden_state[:, 0]
+        raise TypeError(f"Unexpected feature type from CLIP model: {type(feat)}")
+
     with torch.no_grad():
         text_inputs = processor(text=prompts, return_tensors="pt", padding=True).to(dev)
-        text_feats = model.get_text_features(**text_inputs)
+        text_feats = _to_tensor(model.get_text_features(**text_inputs))
         text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
 
     pos_idx = [0, 1, 2]
@@ -405,7 +420,7 @@ def _get_clip_card_scorer(model_id="openai/clip-vit-base-patch32", device="auto"
         pil = Image.fromarray(rgb)
         with torch.no_grad():
             img_inputs = processor(images=pil, return_tensors="pt").to(dev)
-            img_feats = model.get_image_features(**img_inputs)
+            img_feats = _to_tensor(model.get_image_features(**img_inputs))
             img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
 
             sims = (img_feats @ text_feats.T).squeeze(0)

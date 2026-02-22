@@ -20,7 +20,7 @@ SET INPUT_DIR=.
 SET OUTPUT_DIR=output
 
 :: White border added around each card, in pixels (0 = none)
-SET PADDING=10
+SET PADDING=0
 
 :: Debug mode: saves an image showing the detected contour in
 :: green so you can diagnose failures.
