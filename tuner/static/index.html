@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Card Crop Tuner</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ── Header ── -->
+<header class="app-header">
+    <h1>Card Crop Tuner</h1>
+    <nav class="nav-tabs">
+        <button class="nav-tab active" data-page="setup">Setup</button>
+        <button class="nav-tab" data-page="experiment">Experiment</button>
+        <button class="nav-tab" data-page="leaderboard">Leaderboard</button>
+        <button class="nav-tab" data-page="history">History</button>
+    </nav>
+    <div style="flex:1"></div>
+    <button class="btn btn-sm" id="btn-export-lb">Export Leaderboard</button>
+    <button class="btn btn-sm" id="btn-export-csv">Export Votes CSV</button>
+</header>
+
+<!-- ── Setup Page ── -->
+<section id="page-setup" class="page-section app-body">
+    <div class="panel">
+        <div class="panel-title">Dataset</div>
+        <div class="status-bar mb-16" id="dataset-status">
+            <span class="dot"></span>
+            <span>No dataset selected</span>
+        </div>
+        <div class="setup-grid">
+            <div>
+                <label for="input-dir">Input folder (absolute path)</label>
+                <input type="text" id="input-dir" placeholder="/path/to/phone/photos">
+            </div>
+            <div>
+                <label for="output-dir">Output folder (optional)</label>
+                <input type="text" id="output-dir" placeholder="auto: ../tuner_output">
+            </div>
+            <div class="full-width">
+                <button class="btn btn-primary" id="btn-select-dataset">Select Dataset</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Exploration Controls</div>
+        <div class="slider-group">
+            <label>Exploration</label>
+            <input type="range" id="exploration-slider" min="0.1" max="5.0" step="0.1" value="1.0">
+            <span class="slider-value" id="exploration-value">1.0</span>
+        </div>
+        <p class="text-xs dim mb-8">
+            Higher = more exploration (wider Thompson samples). 1.0 = standard Beta posterior.
+        </p>
+        <div class="slider-group">
+            <label>Epsilon</label>
+            <input type="range" id="epsilon-slider" min="0" max="1.0" step="0.05" value="0">
+            <span class="slider-value" id="epsilon-value">0</span>
+        </div>
+        <p class="text-xs dim mb-8">
+            Fraction of batches that choose a random config instead of Thompson sampling.
+        </p>
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Batch Controls</div>
+        <div class="flex-row">
+            <label class="flex-row" style="cursor:pointer">
+                <input type="checkbox" id="pairwise-toggle">
+                <span class="text-sm">Pairwise comparison mode</span>
+            </label>
+        </div>
+        <p class="text-xs dim mb-16">
+            When enabled, each image shows results from two configs side-by-side for A/B comparison.
+        </p>
+        <div class="flex-row">
+            <button class="btn btn-success" id="start-batch-btn" disabled>Start New Batch (10 images)</button>
+            <button class="btn btn-danger btn-sm" id="btn-reset">Reset Learning State</button>
+        </div>
+    </div>
+</section>
+
+<!-- ── Experiment Page ── -->
+<section id="page-experiment" class="page-section app-body hidden">
+    <div id="experiment-content">
+        <p class="dim">No active batch. Start one from Setup.</p>
+    </div>
+</section>
+
+<!-- ── Leaderboard Page ── -->
+<section id="page-leaderboard" class="page-section app-body hidden">
+    <div class="panel">
+        <div class="panel-title">Configuration Leaderboard</div>
+        <div id="leaderboard-content">
+            <p class="dim">Loading...</p>
+        </div>
+    </div>
+</section>
+
+<!-- ── History Page ── -->
+<section id="page-history" class="page-section app-body hidden">
+    <div class="panel">
+        <div class="panel-title">Run History</div>
+        <div id="history-content">
+            <p class="dim">Loading...</p>
+        </div>
+    </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

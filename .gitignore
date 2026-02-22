@@ -1,2 +1,5 @@
 __pycache__/
 output/
+tuner/tuner.db
+tuner_output/
+*.pyc
