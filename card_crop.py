@@ -23,7 +23,8 @@ Detection strategy:
   Each candidate contour is scored on rectangularity, aspect ratio,
   area, center proximity, and circularity (to reject the round pan).
 
-Requires:  pip install opencv-python numpy pillow
+Requires:  pip install -r requirements.txt
+           (or just double-click run_card_crop.bat — it sets up a venv automatically)
 
 Usage:
     python card_crop.py                                    # process CWD -> ./output/
