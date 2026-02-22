@@ -5,8 +5,8 @@ REM
 REM  Detects, crops, and straightens baseball cards from phone
 REM  photos taken on a wood table.
 REM
-REM  SETUP (one time):
-REM    pip install opencv-python numpy pillow
+REM  This script automatically creates a Python virtual environment
+REM  and installs all required packages on first run.
 REM
 REM  Drop your phone photos in INPUT_DIR and double-click this.
 REM ============================================================
@@ -30,6 +30,11 @@ SET DEBUG=
 
 :: ---- END SETTINGS -------------------------------------------
 
+SET VENV_DIR=%~dp0.venv
+SET REQUIREMENTS=%~dp0requirements.txt
+SET PYTHON=%VENV_DIR%\Scripts\python.exe
+SET PIP=%VENV_DIR%\Scripts\pip.exe
+
 echo.
 echo  ==========================================
 echo   Baseball Card Photo Cropper
@@ -39,7 +44,45 @@ echo   Output : %OUTPUT_DIR%
 echo   Padding: %PADDING%px
 echo.
 
-python card_crop.py ^
+:: ---- VENV SETUP --------------------------------------------
+
+IF NOT EXIST "%PYTHON%" (
+    echo [SETUP] Creating virtual environment in %VENV_DIR% ...
+    python -m venv "%VENV_DIR%"
+    IF %ERRORLEVEL% NEQ 0 (
+        echo [ERROR] Failed to create virtual environment. Is Python installed?
+        echo         Download from https://www.python.org/downloads/
+        pause
+        exit /b 1
+    )
+)
+
+:: Install / upgrade deps if requirements.txt is newer than our stamp file
+SET STAMP=%VENV_DIR%\.deps_installed
+IF NOT EXIST "%STAMP%" GOTO :install_deps
+FOR /F %%A IN ('dir /b /od "%STAMP%" "%REQUIREMENTS%" 2^>nul') DO SET NEWEST=%%A
+IF /I "%NEWEST%"=="requirements.txt" GOTO :install_deps
+GOTO :deps_ok
+
+:install_deps
+echo [SETUP] Installing dependencies (this may take a few minutes on first run) ...
+"%PIP%" install --upgrade pip >nul 2>&1
+"%PIP%" install -r "%REQUIREMENTS%"
+IF %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERROR] Dependency installation failed. Check the output above.
+    pause
+    exit /b 1
+)
+copy /y nul "%STAMP%" >nul 2>&1
+echo [SETUP] Dependencies ready.
+echo.
+
+:deps_ok
+
+:: ---- RUN ----------------------------------------------------
+
+"%PYTHON%" "%~dp0card_crop.py" ^
     --input-dir  "%INPUT_DIR%"  ^
     --output-dir "%OUTPUT_DIR%" ^
     --padding    "%PADDING%"    ^
