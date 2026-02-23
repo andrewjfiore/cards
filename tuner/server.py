@@ -298,6 +298,9 @@ def sample_images(input_dir: str, n: int = 10, glob_filter: str = "") -> list[st
 def startup():
     db.init_db()
     seed_configs()
+    # Pre-download detector weights with a timeout so stalled downloads
+    # don't freeze the first batch.  Models that fail are marked unavailable.
+    crop_runner.warmup_models(timeout=90)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
