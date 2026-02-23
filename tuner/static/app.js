@@ -726,7 +726,11 @@ function renderHistory() {
                     ${vs.failures ? `<span class="vote-pill failure">${vs.failures} fail</span>` : ''}
                     ${vs.total ? '' : '<span class="dim text-xs">no votes</span>'}
                 </div>
-                <button class="btn btn-sm" onclick="viewBatch(${b.id})">View</button>
+                <div class="batch-actions">
+                    <button class="btn btn-sm" onclick="viewBatch(${b.id})">View</button>
+                    <button class="btn btn-sm btn-rescore" onclick="rescoreBatch(${b.id})" title="Re-run with same config, overwrites old score">Re-score</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteBatch(${b.id})" title="Delete batch and reverse leaderboard effects">Delete</button>
+                </div>
             </div>
         `;
     }).join('');
@@ -768,6 +772,46 @@ async function viewBatch(batchId) {
         renderExperiment();
     } catch (e) {
         alert('Error: ' + e.message);
+    }
+}
+
+async function deleteBatch(batchId) {
+    if (!confirm(`Delete batch #${batchId}? This will remove all votes and reverse leaderboard effects.`)) return;
+    try {
+        await api(`/api/batches/${batchId}`, { method: 'DELETE' });
+        loadHistory();
+    } catch (e) {
+        alert('Error deleting batch: ' + e.message);
+    }
+}
+
+async function rescoreBatch(batchId) {
+    if (!confirm(`Re-score batch #${batchId}? This will delete the old batch and start a new one with the same config.`)) return;
+    if (state.processing) return alert('A batch is already processing.');
+
+    try {
+        const batch = await api(`/api/batches/${batchId}/rescore`, { method: 'POST' });
+        state.batch = batch;
+        state.votes = {};
+        state.batchItems = batch.images.map(img => ({
+            ...img,
+            output_path: '',
+            debug_path: '',
+            status: 'pending',
+            strategy: '',
+            output_path_b: '',
+            debug_path_b: '',
+            status_b: null,
+            strategy_b: null,
+        }));
+        state.processing = true;
+        state.processProgress = 0;
+
+        navigate('experiment');
+        renderExperiment();
+        processBatch(batch.batch_id);
+    } catch (e) {
+        alert('Error re-scoring: ' + e.message);
     }
 }
 

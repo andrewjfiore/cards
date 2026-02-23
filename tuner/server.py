@@ -715,6 +715,106 @@ async def export_votes_csv():
     )
 
 
+def recalculate_arm(config_id: int):
+    """Recalculate an arm's alpha/beta by replaying all remaining votes."""
+    db.reset_arm(config_id)
+    votes = db.get_votes_for_config(config_id)
+
+    for v in votes:
+        vote = v["vote"]
+        confidence = v["confidence"]
+        pairwise_winner = v.get("pairwise_winner")
+        batch_config_id = v["batch_config_id"]
+        batch_config_id_b = v["batch_config_id_b"]
+
+        if pairwise_winner and batch_config_id_b:
+            conf_weight = {"sure": 1.0, "maybe": 0.5, "unsure": 0.25}.get(confidence, 1.0)
+            if pairwise_winner == "a":
+                if batch_config_id == config_id:
+                    db.update_arm(config_id, 1.0 * conf_weight, 0.0)
+                elif batch_config_id_b == config_id:
+                    db.update_arm(config_id, 0.0, 1.0 * conf_weight)
+            elif pairwise_winner == "b":
+                if batch_config_id_b == config_id:
+                    db.update_arm(config_id, 1.0 * conf_weight, 0.0)
+                elif batch_config_id == config_id:
+                    db.update_arm(config_id, 0.0, 1.0 * conf_weight)
+            elif pairwise_winner == "tie":
+                db.update_arm(config_id, 0.25 * conf_weight, 0.25 * conf_weight)
+        else:
+            if batch_config_id == config_id:
+                d_alpha, d_beta = compute_vote_deltas(vote, confidence)
+                db.update_arm(config_id, d_alpha, d_beta)
+
+
+@app.delete("/api/batches/{batch_id}")
+async def delete_batch_endpoint(batch_id: int):
+    """Delete a batch and all its votes, then recalculate affected arms."""
+    batch = db.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    config_ids = db.delete_batch(batch_id)
+    for cid in config_ids:
+        recalculate_arm(cid)
+
+    return {"ok": True, "deleted_batch_id": batch_id, "recalculated_configs": config_ids}
+
+
+@app.post("/api/batches/{batch_id}/rescore")
+async def rescore_batch(batch_id: int):
+    """Delete a batch's votes/effects and start a new batch with the same config."""
+    batch = db.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    if not _state["input_dir"]:
+        raise HTTPException(400, "No dataset selected — call /api/datasets/select first")
+
+    config_id = batch["config_id"]
+    config_id_b = batch.get("config_id_b")
+    mode = batch.get("mode", "single")
+
+    # Delete old batch and recalculate arms
+    affected_config_ids = db.delete_batch(batch_id)
+    for cid in affected_config_ids:
+        recalculate_arm(cid)
+
+    # Start a new batch with the same config
+    images = sample_images(_state["input_dir"], 10, _state["glob_filter"])
+    if not images:
+        raise HTTPException(400, "No images found in input directory")
+
+    batch_num = len(db.get_batches()) + 1
+    output_root = str(Path(_state["output_root"]) / f"batch_{batch_num:04d}")
+
+    new_batch_id = db.create_batch(
+        config_id, _state["input_dir"], output_root,
+        config_id_b=config_id_b, mode=mode,
+    )
+
+    cfg = json.loads(db.get_config(config_id)["json_cfg"])
+    cfg_b = None
+    if config_id_b:
+        cfg_b = json.loads(db.get_config(config_id_b)["json_cfg"])
+
+    items = []
+    for img_path in images:
+        item_id = db.add_batch_item(new_batch_id, img_path)
+        items.append({"id": item_id, "filename": img_path})
+
+    return {
+        "batch_id": new_batch_id,
+        "config_id": config_id,
+        "config": cfg,
+        "config_id_b": config_id_b,
+        "config_b": cfg_b,
+        "mode": mode,
+        "images": items,
+        "output_root": output_root,
+    }
+
+
 @app.post("/api/reset")
 async def reset_learning():
     db.reset_arms()
