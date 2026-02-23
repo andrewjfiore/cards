@@ -8,6 +8,7 @@ This avoids the enormous overhead of spawning a fresh Python subprocess
 """
 
 import argparse
+import concurrent.futures
 import sys
 from pathlib import Path
 
@@ -23,6 +24,43 @@ import card_crop  # noqa: E402  (must come after path manipulation)
 # detect when the tuner config changes the model/device and reload.
 _ml_scorer = None
 _ml_scorer_key = None  # (model_id, device)
+
+
+# ── Model warmup ──────────────────────────────────────────────────────────
+
+def warmup_models(timeout: int = 90):
+    """Pre-load detector models with a timeout so a stalled download
+    doesn't hang the server forever.  Models that fail to load within
+    *timeout* seconds are cached as None (unavailable) in card_crop's
+    global cache so later calls skip them instantly.
+
+    Call this once at server startup.
+    """
+    detectors = [
+        ("rtdetr", card_crop._DEFAULT_MODELS["rtdetr"]),
+        ("yolo", card_crop._DEFAULT_MODELS["yolo"]),
+    ]
+
+    for det_type, model_id in detectors:
+        key = (det_type, model_id)
+        if key in card_crop._DETECTOR_MODEL_CACHE:
+            continue  # already loaded from a previous run
+
+        print(f"[WARMUP] Loading {det_type} ({model_id}) …", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(card_crop._load_detector, det_type, model_id)
+            try:
+                model = fut.result(timeout=timeout)
+                if model is not None:
+                    print(f"[WARMUP] {det_type} ready.", flush=True)
+                else:
+                    print(f"[WARMUP] {det_type} unavailable (load returned None).", flush=True)
+            except concurrent.futures.TimeoutError:
+                print(f"[WARMUP] {det_type} download timed out after {timeout}s — "
+                      "marking unavailable. Configs needing this detector "
+                      "will fall back to contour.", flush=True)
+                # Cache as None so card_crop never retries.
+                card_crop._DETECTOR_MODEL_CACHE[key] = None
 
 
 def _cfg_to_namespace(cfg: dict) -> argparse.Namespace:
