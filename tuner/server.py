@@ -44,8 +44,8 @@ _state = {
     "input_dir": "",
     "output_root": "",
     "glob_filter": "*.jpg,*.jpeg,*.png,*.JPG,*.JPEG,*.PNG",
-    "exploration": 1.0,   # 0..3  (multiplied into alpha0/beta0 priors)
-    "epsilon": 0.0,       # epsilon-greedy mix  0..1
+    "exploration": 1.0,   # 0..5  scales the Beta prior (higher = wider posterior = more exploration)
+    "epsilon": 0.15,      # epsilon-greedy mix  0..1  (15% random picks ensures coverage)
 }
 
 
@@ -220,12 +220,20 @@ def thompson_select(exclude_config_id: int = None) -> int:
     if epsilon > 0 and random.random() < epsilon:
         return random.choice(arms)["config_id"]
 
-    # Thompson sample from Beta(alpha * exploration, beta * exploration)
-    # (higher exploration = more prior weight = more exploration)
+    # Thompson sample from Beta(alpha_evidence + prior, beta_evidence + prior).
+    # The exploration slider scales the PRIOR portion only (the initial
+    # 1.0/1.0 that every arm starts with).  A larger prior relative to
+    # the evidence makes the posterior wider → more exploration.
+    # With the default slider at 1.0 and arms starting at (1,1), this is
+    # equivalent to standard Thompson sampling.
     samples = []
     for arm in arms:
-        a = arm["alpha"] * exploration
-        b = arm["beta"] * exploration
+        # Accumulated evidence = current value minus the initial prior of 1.0
+        ev_a = max(arm["alpha"] - 1.0, 0.0)
+        ev_b = max(arm["beta"] - 1.0, 0.0)
+        # Scale the prior by the exploration slider
+        a = ev_a + exploration
+        b = ev_b + exploration
         # Clamp to avoid degenerate distributions
         a = max(a, 0.01)
         b = max(b, 0.01)
