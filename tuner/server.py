@@ -46,6 +46,7 @@ _state = {
     "glob_filter": "*.jpg,*.jpeg,*.png,*.JPG,*.JPEG,*.PNG",
     "exploration": 1.0,   # 0..5  scales the Beta prior (higher = wider posterior = more exploration)
     "epsilon": 0.15,      # epsilon-greedy mix  0..1  (15% random picks ensures coverage)
+    "padding": 0,         # 0..50  extra px around card boundary (overrides config default when > 0)
 }
 
 
@@ -469,6 +470,13 @@ async def process_batch(batch_id: int):
     if config_id_b:
         cfg_b = json.loads(db.get_config(config_id_b)["json_cfg"])
 
+    # Apply global padding override if set
+    pad = _state.get("padding", 0)
+    if pad > 0:
+        cfg["padding"] = pad
+        if cfg_b:
+            cfg_b["padding"] = pad
+
     async def generate():
         for i, item in enumerate(items):
             img_path = item["filename"]
@@ -826,6 +834,7 @@ async def get_settings():
     return {
         "exploration": _state["exploration"],
         "epsilon": _state["epsilon"],
+        "padding": _state["padding"],
     }
 
 
@@ -836,7 +845,9 @@ async def update_settings(req: Request):
         _state["exploration"] = max(0.1, min(5.0, float(body["exploration"])))
     if "epsilon" in body:
         _state["epsilon"] = max(0.0, min(1.0, float(body["epsilon"])))
-    return {"ok": True, **{k: _state[k] for k in ("exploration", "epsilon")}}
+    if "padding" in body:
+        _state["padding"] = max(0, min(50, int(body["padding"])))
+    return {"ok": True, **{k: _state[k] for k in ("exploration", "epsilon", "padding")}}
 
 
 # ── Serve images from output dirs ───────────────────────────────────────────

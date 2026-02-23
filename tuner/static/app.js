@@ -15,6 +15,7 @@ const state = {
     batches: [],
     exploration: 1.0,
     epsilon: 0.0,
+    padding: 0,
     pairwiseMode: false,
     votes: {},            // batch_item_id -> {vote, confidence, reason_tags, pairwise_winner}
 };
@@ -106,6 +107,7 @@ async function loadSettings() {
         const s = await api('/api/settings');
         state.exploration = s.exploration;
         state.epsilon = s.epsilon;
+        state.padding = s.padding || 0;
     } catch (e) { /* ignore */ }
 }
 
@@ -116,6 +118,7 @@ async function saveSettings() {
             body: JSON.stringify({
                 exploration: state.exploration,
                 epsilon: state.epsilon,
+                padding: state.padding,
             }),
         });
     } catch (e) {
@@ -778,9 +781,11 @@ async function viewBatch(batchId) {
 async function deleteBatch(batchId) {
     if (!confirm(`Delete batch #${batchId}? This will remove all votes and reverse leaderboard effects.`)) return;
     try {
-        await api(`/api/batches/${batchId}`, { method: 'DELETE' });
+        const res = await api(`/api/batches/${batchId}`, { method: 'DELETE' });
+        console.log('Deleted batch', batchId, res);
         loadHistory();
     } catch (e) {
+        console.error('Delete error:', e);
         alert('Error deleting batch: ' + e.message);
     }
 }
@@ -870,6 +875,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     epsilonSlider.addEventListener('change', () => saveSettings());
 
+    // Padding slider
+    const paddingSlider = $('#padding-slider');
+    const paddingValue = $('#padding-value');
+    paddingSlider.addEventListener('input', function() {
+        state.padding = parseInt(this.value);
+        paddingValue.textContent = this.value + 'px';
+    });
+    paddingSlider.addEventListener('change', () => saveSettings());
+
     // Load initial data
     loadDatasetInfo();
     loadSettings().then(() => {
@@ -880,6 +894,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (epsilonSlider) {
             epsilonSlider.value = state.epsilon;
             epsilonValue.textContent = state.epsilon;
+        }
+        if (paddingSlider) {
+            paddingSlider.value = state.padding;
+            paddingValue.textContent = state.padding + 'px';
         }
     });
 
