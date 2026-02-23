@@ -163,6 +163,50 @@ def reset_arms():
     conn.commit()
 
 
+def reset_arm(config_id: int):
+    """Reset a single arm back to prior (1.0, 1.0)."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE arms SET alpha = 1.0, beta = 1.0, last_tested_at = NULL WHERE config_id = ?",
+        (config_id,),
+    )
+    conn.commit()
+
+
+def delete_batch(batch_id: int) -> list[int]:
+    """Delete a batch, its items, and all votes. Returns affected config_ids."""
+    conn = _conn()
+    batch = get_batch(batch_id)
+    if not batch:
+        return []
+
+    config_ids = [batch["config_id"]]
+    if batch.get("config_id_b"):
+        config_ids.append(batch["config_id_b"])
+
+    conn.execute("""
+        DELETE FROM votes WHERE batch_item_id IN (
+            SELECT id FROM batch_items WHERE batch_id = ?
+        )
+    """, (batch_id,))
+    conn.execute("DELETE FROM batch_items WHERE batch_id = ?", (batch_id,))
+    conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+    conn.commit()
+    return config_ids
+
+
+def get_votes_for_config(config_id: int):
+    """Get all votes for batches that used this config (primary or pairwise B)."""
+    return dicts_from_rows(_conn().execute("""
+        SELECT v.*, b.config_id AS batch_config_id, b.config_id_b AS batch_config_id_b
+        FROM votes v
+        JOIN batch_items bi ON v.batch_item_id = bi.id
+        JOIN batches b ON bi.batch_id = b.id
+        WHERE b.config_id = ? OR b.config_id_b = ?
+        ORDER BY v.id
+    """, (config_id, config_id)).fetchall())
+
+
 # ── batches ──────────────────────────────────────────────────────────────────
 
 def create_batch(config_id: int, input_dir: str, output_root: str,

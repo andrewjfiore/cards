@@ -63,6 +63,14 @@
         <p class="text-xs dim mb-8">
             Fraction of batches that choose a random config instead of Thompson sampling.
         </p>
+        <div class="slider-group">
+            <label>Padding</label>
+            <input type="range" id="padding-slider" min="0" max="50" step="1" value="0">
+            <span class="slider-value" id="padding-value">0px</span>
+        </div>
+        <p class="text-xs dim mb-8">
+            Extra pixels added around the detected card boundary. Overrides per-config padding. 0 = use config default.
+        </p>
     </div>
 
     <div class="panel">
