@@ -487,13 +487,25 @@ def _load_detector(detector_type, model_id="", device="auto"):
         _DETECTOR_MODEL_CACHE[key] = None
         return None
 
+    # Resolve bare filenames to a local .pt file so ultralytics doesn't
+    # try to download from the internet when the file is already on disk.
+    resolved_id = model_id
+    if not Path(model_id).is_absolute():
+        script_dir = Path(__file__).resolve().parent
+        # Check CWD, the directory containing this script, and tuner/.
+        for search_dir in [Path.cwd(), script_dir, script_dir / "tuner"]:
+            candidate = search_dir / model_id
+            if candidate.is_file():
+                resolved_id = str(candidate)
+                break
+
     # Try loading; if it fails with a corrupted archive, delete and retry once.
     for attempt in range(2):
         try:
             if detector_type == "rtdetr":
-                model = RTDETR(model_id)
+                model = RTDETR(resolved_id)
             else:
-                model = YOLO(model_id)
+                model = YOLO(resolved_id)
             _DETECTOR_MODEL_CACHE[key] = model
             return model
         except Exception as e:
@@ -502,7 +514,7 @@ def _load_detector(detector_type, model_id="", device="auto"):
                           or "unexpected EOF" in err.lower())
             if is_corrupt and attempt == 0:
                 # Delete the corrupted file so ultralytics re-downloads it.
-                local = Path(model_id)
+                local = Path(resolved_id)
                 if local.exists() and local.is_file():
                     print(f"[WARN] Corrupted model file '{model_id}'; deleting for re-download ...")
                     local.unlink()
