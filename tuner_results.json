@@ -1,0 +1,39 @@
+{
+  "target_rate": 0.75,
+  "configs_tested": 1,
+  "best_config": {
+    "detector": "rtdetr",
+    "detector_conf": 0.45,
+    "ocr_refine": true,
+    "ml_refine": true,
+    "ml_weight": 0.4,
+    "padding": 10,
+    "no_resize": false,
+    "debug": false
+  },
+  "best_rate": 0.76,
+  "all_results": [
+    {
+      "config": {
+        "detector": "rtdetr",
+        "detector_conf": 0.45,
+        "ocr_refine": true,
+        "ml_refine": true,
+        "ml_weight": 0.4,
+        "padding": 10,
+        "no_resize": false,
+        "debug": false
+      },
+      "correct_rate": 0.76,
+      "correct_count": 19,
+      "total_count": 25,
+      "details": {
+        "aspect_failures": 0,
+        "background_failures": 1,
+        "orientation_failures": 1,
+        "rectangle_failures": 0,
+        "face_position_failures": 5
+      }
+    }
+  ]
+}
