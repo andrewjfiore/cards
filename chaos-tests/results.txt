@@ -1,0 +1,110 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /home/andrew/repos/cards
+plugins: hypothesis-6.151.9, anyio-4.12.1, mock-3.15.1, cov-7.0.0, langsmith-0.7.1
+collecting ... collected 43 items
+
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_zero_byte_file PASSED [  2%]
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_truncated_jpeg PASSED [  4%]
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_random_bytes_as_jpg PASSED [  6%]
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_text_file_as_jpg PASSED [  9%]
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_html_as_jpg PASSED [ 11%]
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_jpeg_with_corrupt_tail PASSED [ 13%]
+chaos-tests/test_cards_chaos.py::TestCorruptImages::test_png_file_as_jpg PASSED [ 16%]
+chaos-tests/test_cards_chaos.py::TestExtremeDimensions::test_enormous_image PASSED [ 18%]
+chaos-tests/test_cards_chaos.py::TestExtremeDimensions::test_1x1_image PASSED [ 20%]
+chaos-tests/test_cards_chaos.py::TestExtremeDimensions::test_very_wide_image PASSED [ 23%]
+chaos-tests/test_cards_chaos.py::TestExtremeDimensions::test_single_color_image FAILED [ 25%]
+chaos-tests/test_cards_chaos.py::TestNoCard::test_wood_texture_no_card PASSED [ 27%]
+chaos-tests/test_cards_chaos.py::TestNoCard::test_circular_object_only PASSED [ 30%]
+chaos-tests/test_cards_chaos.py::TestNoCard::test_multiple_card_candidates PASSED [ 32%]
+chaos-tests/test_cards_chaos.py::TestNoCard::test_black_image PASSED     [ 34%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_missing_input_dir PASSED [ 37%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_readonly_output_dir PASSED [ 39%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_extreme_padding_negative PASSED [ 41%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_extreme_padding_huge FAILED [ 44%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_extreme_ocr_min_conf_zero PASSED [ 46%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_extreme_ocr_min_conf_above_one PASSED [ 48%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_ml_weight_zero PASSED [ 51%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_ml_weight_out_of_range PASSED [ 53%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_detector_conf_zero PASSED [ 55%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_empty_ext PASSED   [ 58%]
+chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_output_dir_is_file FAILED [ 60%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_four_point_transform_degenerate PASSED [ 62%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_four_point_transform_negative_coords PASSED [ 65%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_detect_card_empty_image PASSED [ 67%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_detect_card_solid_white PASSED [ 69%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_detect_card_solid_black PASSED [ 72%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_detect_card_nan_pixels PASSED [ 74%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_score_contour_tiny_area PASSED [ 76%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_order_points_non_standard_input PASSED [ 79%]
+chaos-tests/test_cards_chaos.py::TestInternalAPI::test_process_image_nonexistent_src PASSED [ 81%]
+chaos-tests/test_cards_chaos.py::TestMemoryPerformance::test_batch_100_images_no_oom PASSED [ 83%]
+chaos-tests/test_cards_chaos.py::TestMemoryPerformance::test_rapid_successive_calls PASSED [ 86%]
+chaos-tests/test_cards_chaos.py::TestMemoryPerformance::test_empty_input_dir PASSED [ 88%]
+chaos-tests/test_cards_chaos.py::TestHypothesisCards::test_detect_card_small_images PASSED [ 90%]
+chaos-tests/test_cards_chaos.py::TestHypothesisCards::test_four_point_transform_arbitrary PASSED [ 93%]
+chaos-tests/test_cards_chaos.py::TestCrashIsolation::test_input_dir_is_a_file PASSED [ 95%]
+chaos-tests/test_cards_chaos.py::TestCrashIsolation::test_symlink_loop PASSED [ 97%]
+chaos-tests/test_cards_chaos.py::TestCrashIsolation::test_dry_run_no_output PASSED [100%]
+
+=================================== FAILURES ===================================
+________________ TestExtremeDimensions.test_single_color_image _________________
+chaos-tests/test_cards_chaos.py:193: in test_single_color_image
+    assert "No card detected" in out or "FAIL" in out, "Should report no card found"
+E   AssertionError: Should report no card found
+E   assert ('No card detected' in '[INFO] Input   : /tmp/tmpio64dm_k\n[INFO] Output  : /tmp/pytest-of-andrew/pytest-0/test_single_color_image0\n[INFO] Images  : 1\n[INFO] Padding : 0px\n[INFO] Detector: contour\n\n  solid.jpg                                 [OK] OK (full_frame)\n\n[DONE] 1 succeeded, 0 failed -> /tmp/pytest-of-andrew/pytest-0/test_single_color_image0\n' or 'FAIL' in '[INFO] Input   : /tmp/tmpio64dm_k\n[INFO] Output  : /tmp/pytest-of-andrew/pytest-0/test_single_color_image0\n[INFO] Images  : 1\n[INFO] Padding : 0px\n[INFO] Detector: contour\n\n  solid.jpg                                 [OK] OK (full_frame)\n\n[DONE] 1 succeeded, 0 failed -> /tmp/pytest-of-andrew/pytest-0/test_single_color_image0\n')
+___________________ TestCLIFuzzing.test_extreme_padding_huge ___________________
+chaos-tests/test_cards_chaos.py:282: in test_extreme_padding_huge
+    assert "Traceback" not in err, f"Exception with huge padding: {err}"
+E   AssertionError: Exception with huge padding: Traceback (most recent call last):
+E       File "/home/andrew/repos/cards/card_crop.py", line 1345, in <module>
+E         main()
+E       File "/home/andrew/repos/cards/card_crop.py", line 1313, in main
+E         success, msg, ocr_inline = process_image(img_path, out_path, args, debug_dir, ml_scorer=ml_scorer)
+E                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       File "/home/andrew/repos/cards/card_crop.py", line 1162, in process_image
+E         warped = cv2.copyMakeBorder(warped, p, p, p, p,
+E                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E     cv2.error: OpenCV(4.13.0) /io/opencv/modules/core/src/alloc.cpp:73: error: (-4:Insufficient memory) Failed to allocate 121131788943 bytes in function 'OutOfMemoryError'
+E     
+E     
+E   assert 'Traceback' not in "Traceback (...ryError'\n\n"
+E     
+E     'Traceback' is contained here:
+E       Traceback (most recent call last):
+E     ? +++++++++
+E         File "/home/andrew/repos/cards/card_crop.py", line 1345, in <module>
+E           main()
+E         File "/home/andrew/repos/cards/card_crop.py", line 1313, in main...
+E     
+E     ...Full output truncated (7 lines hidden), use '-vv' to show
+____________________ TestCLIFuzzing.test_output_dir_is_file ____________________
+chaos-tests/test_cards_chaos.py:327: in test_output_dir_is_file
+    assert "Traceback" not in err, f"Exception: {err}"
+E   AssertionError: Exception: Traceback (most recent call last):
+E       File "/home/andrew/repos/cards/card_crop.py", line 1345, in <module>
+E         main()
+E       File "/home/andrew/repos/cards/card_crop.py", line 1275, in main
+E         output_dir.mkdir(parents=True, exist_ok=True)
+E       File "/usr/lib/python3.12/pathlib.py", line 1313, in mkdir
+E         os.mkdir(self, mode)
+E     FileExistsError: [Errno 17] File exists: '/tmp/pytest-of-andrew/pytest-0/test_output_dir_is_file0/afile.txt'
+E     
+E   assert 'Traceback' not in "Traceback (...afile.txt'\n"
+E     
+E     'Traceback' is contained here:
+E       Traceback (most recent call last):
+E     ? +++++++++
+E         File "/home/andrew/repos/cards/card_crop.py", line 1345, in <module>
+E           main()
+E         File "/home/andrew/repos/cards/card_crop.py", line 1275, in main...
+E     
+E     ...Full output truncated (4 lines hidden), use '-vv' to show
+=========================== short test summary info ============================
+FAILED chaos-tests/test_cards_chaos.py::TestExtremeDimensions::test_single_color_image
+FAILED chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_extreme_padding_huge
+FAILED chaos-tests/test_cards_chaos.py::TestCLIFuzzing::test_output_dir_is_file
+=================== 3 failed, 40 passed in 64.14s (0:01:04) ====================

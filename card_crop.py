@@ -117,6 +117,8 @@ def parse_args():
                    help="Ultralytics model id (e.g. rtdetr-x, yolo12x). Empty = sensible default per --detector")
     p.add_argument("--detector-conf", type=float, default=0.35,
                    help="Minimum confidence for object detector (default: 0.35)")
+    p.add_argument("--auto-quality-report", action="store_true", dest="auto_quality_report",
+                   help="After cropping, automatically run crop_quality_rater on output and save report.json")
     return p.parse_args()
 
 
@@ -949,6 +951,55 @@ def detect_card(img, ml_scorer=None, ml_weight=0.40):
         _add_mask_candidates(variant, img_area, candidates, f"scharr#{idx}", img_shape)
 
     # ------------------------------------------------------------------
+    # Strategy 8 — CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # CLAHE enhances local contrast and is especially effective for photos
+    # taken under uneven indoor lighting or with glare on glossy cards.
+    # Inspired by document-scanning techniques from open-source projects
+    # such as pyimagesearch and card-detector community approaches.
+    # ------------------------------------------------------------------
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray_clahe = clahe.apply(gray)
+    # Bilateral filter after CLAHE to smooth noise while preserving edges
+    clahe_bilateral = cv2.bilateralFilter(gray_clahe, 11, 75, 75)
+    _, binary8 = cv2.threshold(clahe_bilateral, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for idx, variant in enumerate(_morph_variants(binary8)):
+        _add_mask_candidates(variant, img_area, candidates, f"clahe+otsu#{idx}", img_shape)
+    inv8 = cv2.bitwise_not(binary8)
+    for idx, variant in enumerate(_morph_variants(inv8)):
+        _add_mask_candidates(variant, img_area, candidates, f"clahe+otsu_inv#{idx}", img_shape)
+
+    # CLAHE + adaptive threshold (combined approach for very uneven lighting)
+    for bsz in [31, 51]:
+        for C in [-8, -15]:
+            binary8b = cv2.adaptiveThreshold(
+                clahe_bilateral, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+                bsz, C
+            )
+            for idx, variant in enumerate(_morph_variants(binary8b)):
+                _add_mask_candidates(
+                    variant, img_area, candidates,
+                    f"clahe_adapt(b={bsz},C={C})#{idx}", img_shape
+                )
+
+    # ------------------------------------------------------------------
+    # Strategy 9 — Sobel gradient + morphological closing
+    # Complements Scharr with a different kernel; captures card borders
+    # at 45-degree angles where Scharr may be weaker.
+    # ------------------------------------------------------------------
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    sobel_mag = cv2.magnitude(sobel_x, sobel_y)
+    sobel_u8 = cv2.convertScaleAbs(sobel_mag)
+    sobel_blur = cv2.GaussianBlur(sobel_u8, (5, 5), 0)
+    _, binary9 = cv2.threshold(sobel_blur, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for idx, variant in enumerate(_morph_variants(binary9, close_sizes=(9, 13, 17),
+                                                  open_sizes=(5, 9))):
+        _add_mask_candidates(variant, img_area, candidates, f"sobel#{idx}", img_shape)
+
+    # ------------------------------------------------------------------
     # Full-frame candidate — if the image aspect ratio matches a card,
     # inject the image boundary as a moderate-score candidate.  In
     # normal photos real card contours outscore it; in re-crops (where
@@ -965,7 +1016,10 @@ def detect_card(img, ml_scorer=None, ml_weight=0.40):
             [[m, m]], [[w - 1 - m, m]],
             [[w - 1 - m, h - 1 - m]], [[m, h - 1 - m]]
         ], dtype=np.int32)
-        candidates.append((frame_score, frame_quad, "full_frame"))
+        # C3: Only use full_frame fallback if image has some actual content
+        frame_content = _card_content_score(img, frame_quad)
+        if frame_content > 0.15:
+            candidates.append((frame_score, frame_quad, "full_frame"))
 
     if not candidates:
         return None, None
@@ -1175,12 +1229,47 @@ def collect_images(input_dir, extensions):
     return sorted(set(images))
 
 
+def _run_auto_quality_report(output_dir: Path):
+    """Run crop_quality_rater on output_dir and save quality_report.json.
+
+    This is triggered by --auto-quality-report and provides an immediate
+    quality assessment of every cropped card without a separate command.
+    Silently skips if crop_quality_rater is not importable.
+    """
+    try:
+        from crop_quality_rater import rate_directory
+    except ImportError:
+        print("[QUALITY] crop_quality_rater not available; skipping auto quality report")
+        return
+
+    print("[QUALITY] Running automatic quality rating on output...")
+    try:
+        report = rate_directory(output_dir, verbose=False)
+        report_path = output_dir / "quality_report.json"
+        import json as _json
+        with open(report_path, "w") as f:
+            _json.dump(report, f, indent=2)
+        summary = report.get("summary", {})
+        mean = summary.get("mean_overall", "N/A")
+        pass70 = summary.get("pass_rate_70", "N/A")
+        print(f"[QUALITY] Mean score: {mean}/100  |  Pass rate (≥70): {pass70}%")
+        print(f"[QUALITY] Report saved -> {report_path}")
+    except Exception as e:
+        print(f"[QUALITY] Auto quality report failed: {e}")
+
+
 def main():
     args = parse_args()
     args = apply_interactive_options(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     extensions = [e.strip().lstrip(".") for e in args.ext.split(",")]
+
+    # C1: Guard against OOM from extreme padding values
+    MAX_PADDING = 1000
+    if args.padding < 0 or args.padding > MAX_PADDING:
+        print(f"[ERROR] --padding must be between 0 and {MAX_PADDING} (got {args.padding})")
+        sys.exit(1)
 
     if not input_dir.is_dir():
         print(f"[ERROR] Input directory not found: {input_dir}")
@@ -1192,6 +1281,10 @@ def main():
         sys.exit(0)
 
     if not args.dry_run:
+        # C2: Catch case where output path exists as a file (not a directory)
+        if output_dir.exists() and not output_dir.is_dir():
+            print(f"[ERROR] Output path exists but is not a directory: {output_dir}")
+            sys.exit(1)
         output_dir.mkdir(parents=True, exist_ok=True)
 
     debug_dir = None
@@ -1245,6 +1338,9 @@ def main():
         print(f"\n[DONE] {ok} succeeded, {fail} failed -> {output_dir}")
         if args.debug and debug_dir:
             print(f"[DEBUG] Overlays saved in -> {debug_dir}")
+
+        if args.auto_quality_report and ok > 0:
+            _run_auto_quality_report(output_dir)
 
         if args.ocr_csv:
             csv_path = Path(args.ocr_csv)
