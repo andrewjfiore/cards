@@ -1016,7 +1016,10 @@ def detect_card(img, ml_scorer=None, ml_weight=0.40):
             [[m, m]], [[w - 1 - m, m]],
             [[w - 1 - m, h - 1 - m]], [[m, h - 1 - m]]
         ], dtype=np.int32)
-        candidates.append((frame_score, frame_quad, "full_frame"))
+        # C3: Only use full_frame fallback if image has some actual content
+        frame_content = _card_content_score(img, frame_quad)
+        if frame_content > 0.15:
+            candidates.append((frame_score, frame_quad, "full_frame"))
 
     if not candidates:
         return None, None
@@ -1262,6 +1265,12 @@ def main():
     output_dir = Path(args.output_dir).resolve()
     extensions = [e.strip().lstrip(".") for e in args.ext.split(",")]
 
+    # C1: Guard against OOM from extreme padding values
+    MAX_PADDING = 1000
+    if args.padding < 0 or args.padding > MAX_PADDING:
+        print(f"[ERROR] --padding must be between 0 and {MAX_PADDING} (got {args.padding})")
+        sys.exit(1)
+
     if not input_dir.is_dir():
         print(f"[ERROR] Input directory not found: {input_dir}")
         sys.exit(1)
@@ -1272,6 +1281,10 @@ def main():
         sys.exit(0)
 
     if not args.dry_run:
+        # C2: Catch case where output path exists as a file (not a directory)
+        if output_dir.exists() and not output_dir.is_dir():
+            print(f"[ERROR] Output path exists but is not a directory: {output_dir}")
+            sys.exit(1)
         output_dir.mkdir(parents=True, exist_ok=True)
 
     debug_dir = None
